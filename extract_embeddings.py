@@ -303,6 +303,10 @@ class EmbeddingExtractor:
                     era5_data, era5, sample_inputs, dt)
 
                 emb = self.extract_snapshot(inputs_xr, targets_xr, forcings_xr)
+                n_nan = np.isnan(emb).sum()
+                if n_nan > 0:
+                    self._log(f"  WARNING: snapshot {dt} produced {n_nan} NaNs -- skipping")
+                    continue
                 running_sum += emb.astype(np.float64)
                 n_valid += 1
 
@@ -317,7 +321,9 @@ class EmbeddingExtractor:
         self._log(f"Year {year}: averaged {n_valid} snapshots -> shape {mean_emb.shape}")
 
         os.makedirs(EMBED_DIR, exist_ok=True)
-        np.save(out_path, mean_emb)
+        tmp_path = out_path + '.tmp'
+        np.save(tmp_path, mean_emb)
+        os.rename(tmp_path, out_path)
         self._log(f"Year {year}: saved to {out_path}")
         return mean_emb
 
