@@ -321,7 +321,7 @@ class EmbeddingExtractor:
         self._log(f"Year {year}: averaged {n_valid} snapshots -> shape {mean_emb.shape}")
 
         os.makedirs(EMBED_DIR, exist_ok=True)
-        tmp_path = out_path + '.tmp'
+        tmp_path = out_path.replace('.npy', '.tmp')
         np.save(tmp_path, mean_emb)
         os.rename(tmp_path, out_path)
         self._log(f"Year {year}: saved to {out_path}")
