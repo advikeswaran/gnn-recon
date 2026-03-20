@@ -359,7 +359,7 @@ def train(args, logger: logging.Logger):
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=args.lr,
-        warmup_steps=len(dataset) * 5,
+        warmup_steps=min(len(dataset) * 2, max(1, len(dataset) * args.epochs - 1)),
         decay_steps=len(dataset) * args.epochs,
         end_value=args.lr * 0.01,
     )
@@ -440,9 +440,6 @@ def train(args, logger: logging.Logger):
         elif epoch % 10 == 0:
             save_checkpoint(params, epoch, avg_loss)
 
-        if args.dry_run:
-            logger.info("[DRY RUN] stopping after epoch 1")
-            break
 
     # Save final weights
     final_path = WEIGHTS_DIR / "weights_final.npz"

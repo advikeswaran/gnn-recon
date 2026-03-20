@@ -17,8 +17,7 @@ conda activate graphcast
 cd /glade/derecho/scratch/advike/graphcast_recon
 
 python train_head.py \
-    --epochs 5 \
+    --epochs 200 \
     --lr 1e-3 \
     --hidden 128 \
-    --t2t-rounds 6 \
-    --dry-run
+    --t2t-rounds 6
