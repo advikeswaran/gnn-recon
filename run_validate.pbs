@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -N validate_recon
+#PBS -q main
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -A P93300301
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/validate.out
+#PBS -e /glade/derecho/scratch/advike/graphcast_recon/logs/validate.err
+
+cd /glade/derecho/scratch/advike/graphcast_recon
+
+# --- phase 1: inference (graphcast env) ---
+module load cuda/12.9.0 && module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+python validate.py --phase infer
+
+# --- phase 2: plots (PlotEnv) ---
+source /glade/u/home/advike/PlotEnv/bin/activate
+python validate.py --phase plot

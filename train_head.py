@@ -49,7 +49,7 @@ sys.path.insert(0, str(RECON_DIR))
 # ------------------------------------
 # Constants
 # ------------------------------------
-TRAIN_YEARS    = list(range(1979, 2018))
+TRAIN_YEARS    = list(range(1979, 2001))
 N_TARGET_NODES = 11_160
 N_OUTPUT       = 2
 
