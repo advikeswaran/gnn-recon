@@ -5,38 +5,30 @@ Loads and preprocesses Antarctic ice core data (accumulation + water isotope)
 for use as observation nodes in the reconstruction GNN.
 
 Values served are calibrated to ERA5 units via per-site linear regression
-(see calibrate_ice_cores.py):
-  - iso_value   : 2m temperature (K),   calibrated from dD
-  - accum_value : precipitation (m/yr), calibrated from accumulation
+(see calibrate_ice_cores.py), then expressed as ANOMALIES relative to each
+site's 1979-2000 mean. This ensures the GNN is trained on and applied to
+anomaly fields, avoiding artifacts from changing obs network composition.
 
-Raw CSV files are still used for site coordinates and grid snapping.
-Calibrated time series are loaded from cache/calibration/.
+Anomaly definition:
+  iso_anom(yr)   = calib_iso(yr)   - mean(calib_iso[1979-2000])   [K]
+  accum_anom(yr) = calib_accum(yr) - mean(calib_accum[1979-2000]) [m/yr]
 
-Design decisions:
-  - Sites are grouped by nearest 1deg grid node; values averaged within each group
-  - Node position: snapped to nearest 1deg grid node center
-  - Missing data: site excluded from graph for that year
-  - Embeddings: climatological mean (embedding_clim.npy) used for ALL years
+These anomalies are normalised by ERA5 std only (no mean shift, since
+anomalies are already centered near zero).
 
 Node feature layout (518-dim per observation node):
-  [0]     iso_value    (calibrated temperature in K, or 0.0 if unavailable)
-  [1]     iso_avail    (1.0 if available, 0.0 otherwise)
-  [2]     accum_value  (calibrated precip in m/yr, or 0.0 if unavailable)
-  [3]     accum_avail  (1.0 if available, 0.0 otherwise)
-  [4]     lat          (grid-snapped, degrees)
-  [5]     lon          (grid-snapped, degrees)
-  [6:518] embedding    (512-dim climatological mean GraphCast embedding)
+  [0]     iso_anom_norm    (normalised temperature anomaly, or 0.0 if unavailable)
+  [1]     iso_avail        (1.0 if available, 0.0 otherwise)
+  [2]     accum_anom_norm  (normalised precip anomaly, or 0.0 if unavailable)
+  [3]     accum_avail      (1.0 if available, 0.0 otherwise)
+  [4]     lat              (grid-snapped, degrees)
+  [5]     lon              (grid-snapped, degrees)
+  [6:518] embedding        (512-dim climatological mean GraphCast embedding)
 
 Usage:
-  loader = IceCoreLoader(data_dir, embeddings_dir, calibration_dir)
+  loader = IceCoreLoader(data_dir, embeddings_dir, calibration_dir,
+                         temp_mean, temp_std, prec_mean, prec_std)
   obs = loader.get_year(1990)
-  # obs is a dict:
-  #   'features'     : np.ndarray (N_obs, 518)
-  #   'grid_indices' : np.ndarray (N_obs,) int
-  #   'lats'         : np.ndarray (N_obs,)
-  #   'lons'         : np.ndarray (N_obs,)
-  #   'n_obs'        : int
-  #   'year'         : int
 """
 
 import numpy as np
@@ -54,6 +46,10 @@ TARGET_LONS = np.arange(0, 360, 1, dtype=np.float32)
 N_LAT   = len(TARGET_LATS)
 N_LON   = len(TARGET_LONS)
 N_NODES = N_LAT * N_LON
+
+# 1979-2000 overlap indices within the 1801-2000 calibration array
+OVERLAP_START_IDX = 178   # index of 1979 in recon_years
+OVERLAP_END_IDX   = 200   # exclusive, slice [178:200] = 22 years
 
 WATER_COORD_FIXES = {
     'Mount Brown South': 'MBS',
@@ -92,8 +88,14 @@ def grid_index_to_latlon(grid_idx: int):
 class IceCoreLoader:
 
     def __init__(self, data_dir: str, embeddings_dir: str, calibration_dir: str,
-                 temp_mean: float = 248.26, temp_std: float = 17.29,
-                 prec_mean: float = 0.3608, prec_std: float = 0.3656):
+                 temp_mean: float, temp_std: float,
+                 prec_mean: float, prec_std: float):
+        """
+        temp_mean, temp_std, prec_mean, prec_std must be passed explicitly
+        from norm_stats.npz — no defaults to avoid silent errors.
+        Note: temp_mean and prec_mean are not used for normalisation in
+        anomaly mode, but are retained for reference/logging.
+        """
         self.data_dir        = Path(data_dir)
         self.embeddings_dir  = Path(embeddings_dir)
         self.calibration_dir = Path(calibration_dir)
@@ -105,6 +107,7 @@ class IceCoreLoader:
         print("Loading ice core data...")
         self._load_coords()
         self._load_calibration()
+        self._compute_overlap_means()
         self._build_site_registry()
         self._load_clim_embedding()
         print(f"Ready: {len(self.site_registry)} unique grid nodes, "
@@ -141,8 +144,8 @@ class IceCoreLoader:
                     f"Run calibrate_ice_cores.py first."
                 )
 
-        self.calib_iso   = np.load(iso_path)
-        self.calib_accum = np.load(accum_path)
+        self.calib_iso   = np.load(iso_path)    # (80, 200)
+        self.calib_accum = np.load(accum_path)  # (84, 200)
 
         meta = np.load(meta_path, allow_pickle=True)
         self.calib_iso_site_ids   = [s for s in meta['iso_site_ids']]
@@ -164,10 +167,49 @@ class IceCoreLoader:
               f"{len(self.calib_accum_site_ids)} accum sites, "
               f"years {self.calib_years[0]}-{self.calib_years[-1]}")
 
+    def _compute_overlap_means(self):
+        """
+        Per-site mean over 1979-2000 (indices 178:200).
+        Sites with all-NaN overlap get NaN mean and are excluded from
+        the site registry entirely.
+        """
+        overlap = slice(OVERLAP_START_IDX, OVERLAP_END_IDX)
+        self.iso_site_means   = np.nanmean(
+            self.calib_iso[:, overlap], axis=1).astype(np.float32)   # (80,)
+        self.accum_site_means = np.nanmean(
+            self.calib_accum[:, overlap], axis=1).astype(np.float32) # (84,)
+
+        # compute anomaly std across all sites and years for normalisation
+        iso_anom   = self.calib_iso   - self.iso_site_means[:, None]
+        accum_anom = self.calib_accum - self.accum_site_means[:, None]
+        self.iso_anom_std   = float(np.nanstd(iso_anom))
+        self.accum_anom_std = float(np.nanstd(accum_anom))
+
+        n_iso_valid   = int(np.sum(np.isfinite(self.iso_site_means)))
+        n_accum_valid = int(np.sum(np.isfinite(self.accum_site_means)))
+        print(f"  Overlap means (1979-2000): "
+              f"{n_iso_valid}/{len(self.iso_site_means)} iso valid, "
+              f"{n_accum_valid}/{len(self.accum_site_means)} accum valid")
+        print(f"  Anomaly stds: iso={self.iso_anom_std:.4f}K  "
+              f"accum={self.accum_anom_std:.4f}m/yr")
+
+        # save anomaly stds so validate.py and apply.py can load them
+        # without reinstantiating the full loader
+        import os
+        anom_std_path = self.calibration_dir / 'anom_stds.npz'
+        tmp = str(anom_std_path).replace('.npz', '.tmp.npz')
+        np.savez(tmp,
+                 iso_anom_std=np.float32(self.iso_anom_std),
+                 accum_anom_std=np.float32(self.accum_anom_std))
+        os.rename(tmp, str(anom_std_path))
+
     def _build_site_registry(self):
         self.iso_grid_map = {}
         for sid in self.calib_iso_site_ids:
-            i   = self.iso_site_to_row[sid]
+            i = self.iso_site_to_row[sid]
+            # exclude sites with no valid 1979-2000 overlap mean
+            if not np.isfinite(self.iso_site_means[i]):
+                continue
             lat = float(self.calib_iso_lats[i])
             lon = float(self.calib_iso_lons[i])
             result = snap_to_grid(lat, lon)
@@ -178,7 +220,9 @@ class IceCoreLoader:
 
         self.accum_grid_map = {}
         for sid in self.calib_accum_site_ids:
-            i   = self.accum_site_to_row[sid]
+            i = self.accum_site_to_row[sid]
+            if not np.isfinite(self.accum_site_means[i]):
+                continue
             lat = float(self.calib_accum_lats[i])
             lon = float(self.calib_accum_lons[i])
             result = snap_to_grid(lat, lon)
@@ -211,15 +255,17 @@ class IceCoreLoader:
         yr_idx = self.calib_year_to_idx.get(year, None)
         if yr_idx is None:
             return 0.0, False
-        vals = []
+        anoms = []
         for sid in site_ids:
-            row = self.iso_site_to_row[sid]
-            v   = self.calib_iso[row, yr_idx]
-            if np.isfinite(v):
-                vals.append(float(v))
-        if not vals:
+            row  = self.iso_site_to_row[sid]
+            v    = self.calib_iso[row, yr_idx]
+            mean = self.iso_site_means[row]
+            if np.isfinite(v) and np.isfinite(mean):
+                anoms.append(float(v) - float(mean))
+        if not anoms:
             return 0.0, False
-        norm_val = (float(np.mean(vals)) - self.temp_mean) / self.temp_std
+        # divide by std only — anomalies are already centered near zero
+        norm_val = float(np.mean(anoms)) / self.iso_anom_std
         return norm_val, True
 
     def _get_accum_value(self, grid_idx: int, year: int):
@@ -229,15 +275,16 @@ class IceCoreLoader:
         yr_idx = self.calib_year_to_idx.get(year, None)
         if yr_idx is None:
             return 0.0, False
-        vals = []
+        anoms = []
         for sid in site_ids:
-            row = self.accum_site_to_row[sid]
-            v   = self.calib_accum[row, yr_idx]
-            if np.isfinite(v):
-                vals.append(float(v))
-        if not vals:
+            row  = self.accum_site_to_row[sid]
+            v    = self.calib_accum[row, yr_idx]
+            mean = self.accum_site_means[row]
+            if np.isfinite(v) and np.isfinite(mean):
+                anoms.append(float(v) - float(mean))
+        if not anoms:
             return 0.0, False
-        norm_val = (float(np.mean(vals)) - self.prec_mean) / self.prec_std
+        norm_val = float(np.mean(anoms)) / self.accum_anom_std
         return norm_val, True
 
     def get_year(self, year: int) -> dict:
@@ -285,7 +332,7 @@ class IceCoreLoader:
 
     def summary(self, year: int = None):
         print(f"\n{'='*60}")
-        print(f"IceCoreLoader summary (calibrated values)")
+        print(f"IceCoreLoader summary (anomaly mode, ref: 1979-2000)")
         print(f"{'='*60}")
         print(f"Iso grid nodes:    {len(self.iso_grid_map)}")
         print(f"Accum grid nodes:  {len(self.accum_grid_map)}")
@@ -296,12 +343,12 @@ class IceCoreLoader:
             iso_avail   = obs['features'][:, 1]
             accum_avail = obs['features'][:, 3]
             print(f"\nCoverage for year {year}:")
-            print(f"  Total obs nodes:       {obs['n_obs']}")
-            print(f"  Nodes with iso:        {int(iso_avail.sum())}")
-            print(f"  Nodes with accum:      {int(accum_avail.sum())}")
-            print(f"  iso_value  range (K):  [{obs['features'][:,0].min():.1f}, "
-                  f"{obs['features'][:,0].max():.1f}]")
-            print(f"  accum_value range (m): [{obs['features'][:,2].min():.4f}, "
+            print(f"  Total obs nodes:         {obs['n_obs']}")
+            print(f"  Nodes with iso:          {int(iso_avail.sum())}")
+            print(f"  Nodes with accum:        {int(accum_avail.sum())}")
+            print(f"  iso_anom  range (norm):  [{obs['features'][:,0].min():.3f}, "
+                  f"{obs['features'][:,0].max():.3f}]")
+            print(f"  accum_anom range (norm): [{obs['features'][:,2].min():.4f}, "
                   f"{obs['features'][:,2].max():.4f}]")
         print(f"{'='*60}\n")
 
@@ -311,39 +358,58 @@ class IceCoreLoader:
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    DATA_DIR        = '/glade/derecho/scratch/advike/graphcast_recon/data'
-    EMBEDDINGS_DIR  = '/glade/derecho/scratch/advike/graphcast_recon/cache/embeddings'
-    CALIBRATION_DIR = '/glade/derecho/scratch/advike/graphcast_recon/cache/calibration'
+    import sys
+    RECON_DIR       = '/glade/derecho/scratch/advike/graphcast_recon'
+    DATA_DIR        = f'{RECON_DIR}/data'
+    EMBEDDINGS_DIR  = f'{RECON_DIR}/cache/embeddings'
+    CALIBRATION_DIR = f'{RECON_DIR}/cache/calibration'
+    NORM_STATS_PATH = f'{RECON_DIR}/cache/era5_targets/norm_stats.npz'
 
-    print("=== IceCoreLoader test (calibrated) ===\n")
-    loader = IceCoreLoader(DATA_DIR, EMBEDDINGS_DIR, CALIBRATION_DIR)
+    ns = np.load(NORM_STATS_PATH)
+
+    print("=== IceCoreLoader test (anomaly mode) ===\n")
+    loader = IceCoreLoader(
+        data_dir=DATA_DIR, embeddings_dir=EMBEDDINGS_DIR,
+        calibration_dir=CALIBRATION_DIR,
+        temp_mean=float(ns['temp_mean']), temp_std=float(ns['temp_std']),
+        prec_mean=float(ns['prec_mean']), prec_std=float(ns['prec_std']),
+    )
     loader.summary(year=1990)
 
     print("Testing get_year(1990)...")
     obs = loader.get_year(1990)
 
     print(f"\nResult for year 1990:")
-    print(f"  n_obs:           {obs['n_obs']}")
-    print(f"  features shape:  {obs['features'].shape}")
-    print(f"  iso_value  (K):  min={obs['features'][:,0].min():.1f}, "
-          f"max={obs['features'][:,0].max():.1f}")
-    print(f"  accum_value(m):  min={obs['features'][:,2].min():.4f}, "
+    print(f"  n_obs:                  {obs['n_obs']}")
+    print(f"  features shape:         {obs['features'].shape}")
+    print(f"  iso_anom  (norm): min={obs['features'][:,0].min():.3f}, "
+          f"max={obs['features'][:,0].max():.3f}")
+    print(f"  accum_anom (norm): min={obs['features'][:,2].min():.4f}, "
           f"max={obs['features'][:,2].max():.4f}")
 
-    assert obs['features'].shape[1] == 518,      "Feature dim should be 518"
-    assert obs['features'].dtype == np.float32,  "Wrong dtype"
+    # check mean anomaly over overlap period is near zero
+    print("\nChecking 1979-2000 mean anomaly (should be ~0)...")
+    iso_anoms, accum_anoms = [], []
+    for yr in range(1979, 2001):
+        o = loader.get_year(yr)
+        iso_mask   = o['features'][:, 1] == 1.0
+        accum_mask = o['features'][:, 3] == 1.0
+        if iso_mask.any():
+            iso_anoms.append(o['features'][:, 0][iso_mask].mean())
+        if accum_mask.any():
+            accum_anoms.append(o['features'][:, 2][accum_mask].mean())
+    print(f"  Mean iso anom 1979-2000:   {float(np.mean(iso_anoms)):.4f} (norm)")
+    print(f"  Mean accum anom 1979-2000: {float(np.mean(accum_anoms)):.4f} (norm)")
+
+    assert obs['features'].shape[1] == 518,       "Feature dim should be 518"
+    assert obs['features'].dtype == np.float32,   "Wrong dtype"
     assert not np.any(np.isnan(obs['features'])), "NaNs in features!"
-    assert np.all(obs['lats'] <= -60.0),          "Node outside Antarctic domain!"
-    assert np.all(obs['grid_indices'] < N_NODES), "Grid index out of range!"
+    assert np.all(obs['lats'] <= -60.0),           "Node outside Antarctic domain!"
+    assert np.all(obs['grid_indices'] < N_NODES),  "Grid index out of range!"
 
     iso_avail   = obs['features'][:, 1]
     accum_avail = obs['features'][:, 3]
     assert np.all(np.isin(iso_avail,   [0.0, 1.0])), "iso_avail not binary!"
     assert np.all(np.isin(accum_avail, [0.0, 1.0])), "accum_avail not binary!"
-
-    iso_vals = obs['features'][:, 0][iso_avail == 1.0]
-    if len(iso_vals) > 0:
-        assert iso_vals.min() > 180.0, f"Suspiciously cold T: {iso_vals.min():.1f} K"
-        assert iso_vals.max() < 310.0, f"Suspiciously warm T: {iso_vals.max():.1f} K"
 
     print("\n=== All checks passed ===")

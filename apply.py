@@ -109,17 +109,17 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
     accum_avail_mask = obs_feats_base[:, 3] == 1.0   # (n_obs,) bool
 
     # Map per-site residual stds to obs nodes.
-    # iso_grid_map / accum_grid_map give us which grid nodes have obs, but
-    # IceCoreLoader may merge multiple sites per node. We use the mean residual
-    # std across sites sharing a node, mapped to the obs node ordering.
     iso_grid_indices   = sorted(loader.iso_grid_map.keys())
     accum_grid_indices = sorted(loader.accum_grid_map.keys())
 
-    # Build node-level residual std arrays aligned to obs ordering in get_year()
-    # get_year() iterates site_registry (union of iso+accum grid indices, sorted)
-    # and skips nodes with no available data for that year.
-    # We match by grid index stored in obs["grid_indices"].
     obs_grid_indices = obs["grid_indices"]   # (n_obs,) int32
+
+    # precompute embedding similarity for obs->target edges
+    o2t_sim_np = compute_o2t_edge_sim(
+        obs_grid_indices, o2t_s_np, o2t_r_np,
+        loader.clim_embedding
+    )
+    o2t_sim = jnp.array(o2t_sim_np)
 
     iso_node_std   = np.zeros(n_obs, dtype=np.float32)
     accum_node_std = np.zeros(n_obs, dtype=np.float32)
@@ -139,8 +139,9 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
             accum_node_std[k] = float(np.mean(accum_resid_std[site_indices]))
 
     # Convert residual stds to normalised space for perturbation
-    iso_node_std_norm   = iso_node_std   / temp_std   # (n_obs,)
-    accum_node_std_norm = accum_node_std / prec_std   # (n_obs,)
+    # normalise perturbations by anom_std to match training obs scale
+    iso_node_std_norm   = iso_node_std   / loader.iso_anom_std    # (n_obs,)
+    accum_node_std_norm = accum_node_std / loader.accum_anom_std  # (n_obs,)
 
     # -- ensemble forward passes ----------------------------------------------
     ensemble_preds = np.zeros((N_ENSEMBLE, 11160, 2), dtype=np.float32)
@@ -163,7 +164,7 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
         pred_norm = forward.apply(
             params, None,
             jnp.array(obs_feats_perturbed), tgt_feats,
-            o2t_s, o2t_r, t2t_s, t2t_r,
+            o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r,
         )
         ensemble_preds[e] = np.array(pred_norm)
 
@@ -171,14 +172,19 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
     pred_mean_norm = ensemble_preds.mean(axis=0)   # (11160, 2)
     pred_std_norm  = ensemble_preds.std(axis=0)    # (11160, 2)
 
+    # denormalise: model outputs anomalies normalised by anom_std
+    # add clim_mean to convert anomalies to physical units
+    clim_mean = np.load(
+        os.path.join(CACHE_DIR, "era5_targets", "clim_mean_1979_2000.npy")
+    )  # (11160, 2)
     pred_mean = np.stack([
-        pred_mean_norm[:, 0] * temp_std + temp_mean,
-        pred_mean_norm[:, 1] * prec_std + prec_mean,
+        pred_mean_norm[:, 0] * loader.iso_anom_std   + clim_mean[:, 0],
+        pred_mean_norm[:, 1] * loader.accum_anom_std + clim_mean[:, 1],
     ], axis=1).astype(np.float32)
 
     pred_std = np.stack([
-        pred_std_norm[:, 0] * temp_std,
-        pred_std_norm[:, 1] * prec_std,
+        pred_std_norm[:, 0] * loader.iso_anom_std,
+        pred_std_norm[:, 1] * loader.accum_anom_std,
     ], axis=1).astype(np.float32)
 
     # -- atomic save ----------------------------------------------------------
@@ -205,6 +211,7 @@ def main():
         build_obs_to_target_edges,
         build_target_features,
         make_forward_fn,
+        compute_o2t_edge_sim,
         TARGET_LATS,
         TARGET_LONS,
     )
@@ -266,10 +273,12 @@ def main():
 
     # init with dummy inputs to get pytree structure
     dummy_obs = jnp.zeros((135, 518), dtype=jnp.float32)   # 135 = typical n_obs
-    dummy_o2t_s = jnp.zeros(1, dtype=jnp.int32)
-    dummy_o2t_r = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_s   = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_r   = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_sim = jnp.zeros((1, 1), dtype=jnp.float32)
     params = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
-                          dummy_o2t_s, dummy_o2t_r, t2t_s, t2t_r)
+                          dummy_o2t_s, dummy_o2t_r, dummy_o2t_sim,
+                          t2t_s, t2t_r)
 
     weights_path = os.path.join(RECON_DIR, "weights", "weights_final.npz")
     raw    = np.load(weights_path)

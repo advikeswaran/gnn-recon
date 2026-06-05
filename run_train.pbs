@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -N train_recon_anom
+#PBS -q main
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64GB
+#PBS -l walltime=12:00:00
+#PBS -A P93300301
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/train_anom.out
+#PBS -e /glade/derecho/scratch/advike/graphcast_recon/logs/train_anom.err
+
+cd /glade/derecho/scratch/advike/graphcast_recon
+
+module load cuda/12.9.0 && module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+
+export TF_GPU_ALLOCATOR=cuda_malloc_async
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
+
+python train_head.py --epochs 50 --dry-run --lr 1e-3 --hidden 128 

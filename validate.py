@@ -1,43 +1,24 @@
 """
-validate.py — Evaluate trained reconstruction head on held-out ERA5 years (2001–2005).
+validate.py — Evaluate trained reconstruction GNN on held-out ERA5 years (2001–2005).
+
+Anomaly mode: both obs inputs and targets are anomalies relative to 1979-2000 mean.
 
 Two-phase design (avoids cartopy/JAX conflicts):
 
   Phase 1 — inference  (graphcast conda env):
       python validate.py --phase infer
-      For each val year:
-        - Loads targets_YYYY.npy
-        - Samples ERA5 T and precip at each ice core site grid node -> obs inputs
-        - Assembles 518-dim obs features matching train_head.py layout exactly
-        - Runs GNN forward pass with those year-specific obs
-        - Saves raw (normalised) predictions to cache/validate/pred_YYYY.npy
 
   Phase 2 — plot/metrics  (PlotEnv):
       python validate.py --phase plot
-      Loads predictions + ERA5 targets, denormalises, computes RMSE/bias/r
-      per year and aggregated, saves metrics .npz + diagnostic PNGs.
-
-Usage in a batch script:
-    # --- phase 1 ---
-    module load cuda/12.9.0 && module load conda/latest
-    source $(conda info --base)/etc/profile.d/conda.sh
-    conda activate graphcast
-    python validate.py --phase infer
-
-    # --- phase 2 ---
-    source /glade/u/home/advike/PlotEnv/bin/activate
-    python validate.py --phase plot
 """
 
 import argparse
 import os
 import sys
 
-# ── shared constants ──────────────────────────────────────────────────────────
 RECON_DIR  = "/glade/derecho/scratch/advike/graphcast_recon"
 CACHE_DIR  = os.path.join(RECON_DIR, "cache")
 VAL_YEARS  = list(range(2001, 2006))
-# Must match train_head.py exactly
 HIDDEN         = 128
 T2T_ROUNDS     = 6
 OBS_TO_TGT_DEG = 9.0
@@ -46,10 +27,6 @@ N_OUTPUT       = 2
 
 OUT_DIR = os.path.join(CACHE_DIR, "validate")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PHASE 1 — INFERENCE  (graphcast env)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_infer():
     import numpy as np
@@ -62,6 +39,7 @@ def run_infer():
         build_obs_to_target_edges,
         build_target_features,
         make_forward_fn,
+        compute_o2t_edge_sim,
         TARGET_LATS,
         TARGET_LONS,
     )
@@ -75,10 +53,15 @@ def run_infer():
     temp_std  = float(ns["temp_std"])
     prec_mean = float(ns["prec_mean"])
     prec_std  = float(ns["prec_std"])
-    print(f"[infer] norm stats: T μ={temp_mean:.2f} σ={temp_std:.2f} | "
-          f"P μ={prec_mean:.4f} σ={prec_std:.4f}")
 
-    # ── IceCoreLoader ─────────────────────────────────────────────────────────
+    # ── clim mean (1979-2000) for anomaly computation ─────────────────────────
+    clim_mean = np.load(
+        os.path.join(CACHE_DIR, "era5_targets", "clim_mean_1979_2000.npy")
+    )  # (11160, 2)  col0=T(K) col1=P(m/yr)
+    print(f"[infer] clim mean: T={clim_mean[:,0].mean():.2f}K  "
+          f"P={clim_mean[:,1].mean():.4f}m/yr")
+
+    # ── loader ────────────────────────────────────────────────────────────────
     loader = IceCoreLoader(
         data_dir        = os.path.join(RECON_DIR, "data"),
         embeddings_dir  = os.path.join(CACHE_DIR, "embeddings"),
@@ -88,25 +71,14 @@ def run_infer():
     )
 
     # ── target features (static) ──────────────────────────────────────────────
-    tgt_feats_np = build_target_features(loader.clim_embedding)  # (11160, 514)
-    tgt_feats    = jnp.array(tgt_feats_np)
-    print(f"[infer] tgt_feats shape: {tgt_feats.shape}")
+    tgt_feats = jnp.array(build_target_features(loader.clim_embedding))
+    print(f"[infer] tgt_feats: {tgt_feats.shape}")
 
-    # ── t2t edges (static, cached) ────────────────────────────────────────────
+    # ── t2t edges ─────────────────────────────────────────────────────────────
     t2t_path = os.path.join(CACHE_DIR, "t2t_edges.npz")
-    if os.path.exists(t2t_path):
-        print("[infer] loading cached t2t edges ...")
-        t2t   = np.load(t2t_path)
-        t2t_s = jnp.array(t2t["senders"])
-        t2t_r = jnp.array(t2t["receivers"])
-    else:
-        from train_head import build_target_to_target_edges
-        print("[infer] building t2t edges (may take ~30s) ...")
-        s, r = build_target_to_target_edges(TARGET_LATS, TARGET_LONS,
-                                             TGT_TO_TGT_DEG)
-        np.savez_compressed(t2t_path, senders=s, receivers=r)
-        t2t_s = jnp.array(s)
-        t2t_r = jnp.array(r)
+    t2t      = np.load(t2t_path)
+    t2t_s    = jnp.array(t2t["senders"])
+    t2t_r    = jnp.array(t2t["receivers"])
     print(f"[infer] t2t edges: {t2t_s.shape[0]:,}")
 
     # ── obs grid indices and coordinates ──────────────────────────────────────
@@ -132,21 +104,19 @@ def run_infer():
     o2t_r = jnp.array(o2t_r_np)
     print(f"[infer] o2t edges: {o2t_s.shape[0]:,}")
 
-    # ── model ─────────────────────────────────────────────────────────────────
+    # precompute embedding similarity for static obs->target edges
+    o2t_sim_np = compute_o2t_edge_sim(
+        np.array(obs_grid_indices), o2t_s_np, o2t_r_np,
+        loader.clim_embedding
+    )
+    o2t_sim = jnp.array(o2t_sim_np)
+
+    # ── model + weights ───────────────────────────────────────────────────────
     forward = make_forward_fn(HIDDEN, T2T_ROUNDS)
-
-    # ── load weights ──────────────────────────────────────────────────────────
-    # Weights saved as flat numbered leaves in train_head.py.
-    # Reconstruct pytree structure via forward.init, then overwrite leaves.
-    weights_path = os.path.join(RECON_DIR, "weights", "weights_final.npz")
-    print(f"[infer] loading weights from {weights_path}")
-
     dummy_obs = jnp.zeros((n_obs, 518), dtype=jnp.float32)
-    rng       = jax.random.PRNGKey(0)
-    params    = forward.init(rng, dummy_obs, tgt_feats,
-                             o2t_s, o2t_r, t2t_s, t2t_r)
-
-    raw    = np.load(weights_path)
+    params    = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
+                             o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
+    raw    = np.load(os.path.join(RECON_DIR, "weights", "weights_final.npz"))
     leaves = [raw[str(i)] for i in range(len(raw.files))]
     params = jax.tree_util.tree_unflatten(
         jax.tree_util.tree_structure(params), leaves
@@ -170,45 +140,48 @@ def run_infer():
             print(f"[infer] WARNING: ERA5 targets for {yr} not found, skipping.")
             continue
 
-        # sample ERA5 at obs grid nodes and normalise
-        era5_yr = np.load(tgt_path)  # (11160, 2)  col0=T(K) col1=precip(m/yr)
+        # sample ERA5 anomalies at obs grid nodes
+        # anomaly = ERA5_value - clim_mean, normalised by std only
+        era5_yr = np.load(tgt_path)  # (11160, 2)
 
-        iso_val_norm = np.array(
-            [(era5_yr[g, 0] - temp_mean) / temp_std  for g in iso_grid_indices],
+        iso_obs_norm = np.array(
+            [(era5_yr[g, 0] - clim_mean[g, 0]) / loader.iso_anom_std
+             for g in iso_grid_indices],
             dtype=np.float32)
-        accum_val_norm = np.array(
-            [(era5_yr[g, 1] - prec_mean) / prec_std  for g in accum_grid_indices],
+        accum_obs_norm = np.array(
+            [(era5_yr[g, 1] - clim_mean[g, 1]) / loader.accum_anom_std
+             for g in accum_grid_indices],
             dtype=np.float32)
 
-        # assemble 518-dim obs features matching IceCoreLoader layout exactly:
-        # [iso_val, iso_avail, accum_val, accum_avail, lat, lon, clim_emb_512]
-        # iso nodes:   iso_val set, iso_avail=1, accum_val=0, accum_avail=0
-        # accum nodes: iso_val=0,  iso_avail=0, accum_val set, accum_avail=1
+        print(f"[infer] {yr}: obs T anom norm [{iso_obs_norm.min():.3f}, "
+              f"{iso_obs_norm.max():.3f}]  "
+              f"P anom norm [{accum_obs_norm.min():.3f}, "
+              f"{accum_obs_norm.max():.3f}]")
+
+        # assemble 518-dim obs features matching IceCoreLoader anomaly layout
         obs_feats_list = []
-
         for k, g in enumerate(iso_grid_indices):
             feat = np.concatenate([
-                np.array([iso_val_norm[k], 1.0, 0.0, 0.0,
+                np.array([iso_obs_norm[k], 1.0, 0.0, 0.0,
                           obs_lats[k], obs_lons[k]], dtype=np.float32),
                 loader.clim_embedding[g],
             ])
             obs_feats_list.append(feat)
-
         for k, g in enumerate(accum_grid_indices):
             feat = np.concatenate([
-                np.array([0.0, 0.0, accum_val_norm[k], 1.0,
+                np.array([0.0, 0.0, accum_obs_norm[k], 1.0,
                           obs_lats[n_iso + k], obs_lons[n_iso + k]], dtype=np.float32),
                 loader.clim_embedding[g],
             ])
             obs_feats_list.append(feat)
 
-        obs_feats_np  = np.stack(obs_feats_list).astype(np.float32)  # (n_obs, 518)
+        obs_feats_np  = np.stack(obs_feats_list).astype(np.float32)
         obs_feats_jnp = jnp.array(obs_feats_np)
 
         print(f"[infer] {yr}: running forward pass ...")
         pred_norm = forward.apply(params, None, obs_feats_jnp, tgt_feats,
-                                  o2t_s, o2t_r, t2t_s, t2t_r)
-        pred_norm = np.array(pred_norm)  # (11160, 2)
+                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
+        pred_norm = np.array(pred_norm)  # (11160, 2) normalised anomalies
 
         tmp = out_path.replace(".npy", ".tmp.npy")
         np.save(tmp, pred_norm)
@@ -217,10 +190,6 @@ def run_infer():
 
     print("[infer] done.")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PHASE 2 — METRICS + PLOTS  (PlotEnv)
-# ══════════════════════════════════════════════════════════════════════════════
 
 def run_plot():
     import numpy as np
@@ -234,10 +203,18 @@ def run_plot():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     ns = np.load(os.path.join(CACHE_DIR, "era5_targets", "norm_stats.npz"))
-    temp_mean = float(ns["temp_mean"])
     temp_std  = float(ns["temp_std"])
-    prec_mean = float(ns["prec_mean"])
     prec_std  = float(ns["prec_std"])
+
+    # load anomaly stds used for obs normalisation during training
+    anom_stds      = np.load(os.path.join(CACHE_DIR, "calibration", "anom_stds.npz"))
+    iso_anom_std   = float(anom_stds["iso_anom_std"])
+    accum_anom_std = float(anom_stds["accum_anom_std"])
+
+    # clim mean for converting targets to anomalies
+    clim_mean = np.load(
+        os.path.join(CACHE_DIR, "era5_targets", "clim_mean_1979_2000.npy")
+    )  # (11160, 2)
 
     LATS    = list(range(-60, -91, -1))
     LONS    = list(range(0, 360))
@@ -261,13 +238,21 @@ def run_plot():
             print(f"[plot] WARNING: ERA5 target for {yr} missing, skipping.")
             continue
 
-        pred_norm = np.load(pred_path)
-        tgt       = np.load(tgt_path)
+        pred_norm = np.load(pred_path)   # (11160, 2) normalised anomalies
+        tgt       = np.load(tgt_path)    # (11160, 2) physical
 
-        pred_temp_list.append(pred_norm[:, 0] * temp_std + temp_mean)
-        pred_prec_list.append(pred_norm[:, 1] * prec_std + prec_mean)
-        true_temp_list.append(tgt[:, 0])
-        true_prec_list.append(tgt[:, 1])
+        # denormalise predictions: model outputs normalised by anom_std
+        pred_temp_anom = pred_norm[:, 0] * iso_anom_std    # K anomaly
+        pred_prec_anom = pred_norm[:, 1] * accum_anom_std  # m/yr anomaly
+
+        # convert targets to anomalies
+        true_temp_anom = tgt[:, 0] - clim_mean[:, 0]   # K anomaly
+        true_prec_anom = tgt[:, 1] - clim_mean[:, 1]   # m/yr anomaly
+
+        pred_temp_list.append(pred_temp_anom)
+        pred_prec_list.append(pred_prec_anom)
+        true_temp_list.append(true_temp_anom)
+        true_prec_list.append(true_prec_anom)
         years_found.append(yr)
 
     if not years_found:
@@ -318,7 +303,7 @@ def run_plot():
     metrics["prec_bias_mean"] = float(metrics["prec_bias"].mean())
     metrics["prec_r_mean"]    = float(metrics["prec_r"].mean())
 
-    print("\n-- Validation metrics (2001-2005) -----------------------------------")
+    print("\n-- Validation metrics anomaly mode (2001-2005) ----------------------")
     print(f"{'Year':>6}  {'T RMSE(K)':>10} {'T Bias(K)':>10} {'T r':>8}  "
           f"{'P RMSE(m/yr)':>13} {'P Bias(m/yr)':>13} {'P r':>8}")
     for i, yr in enumerate(years_found):
@@ -382,7 +367,7 @@ def run_plot():
     fig1, axes = plt.subplots(2, 3, figsize=(15, 9),
                                subplot_kw={"projection": PROJ})
     fig1.suptitle(
-        f"Antarctic Reconstruction -- Spatial Error Maps\n"
+        f"Antarctic Reconstruction -- Spatial Error Maps (anomaly mode)\n"
         f"Held-out ERA5 years {years_found[0]}-{years_found[-1]} "
         f"(ERA5-sampled obs, mean over {N_yr} years)", fontsize=11)
     polar_panel(axes[0,0], temp_rmse_map, lons_1d, lats_1d,
@@ -406,8 +391,8 @@ def run_plot():
     # figure 2: time series
     fig2, axes2 = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
     fig2.suptitle(
-        "Antarctic Reconstruction -- Annual Validation Metrics\n"
-        f"Held-out ERA5 years {years_found[0]}-{years_found[-1]} (ERA5-sampled obs)",
+        "Antarctic Reconstruction -- Annual Validation Metrics (anomaly mode)\n"
+        f"Held-out ERA5 years {years_found[0]}-{years_found[-1]}",
         fontsize=11)
     yrs = np.array(years_found)
     _panels = [
@@ -437,25 +422,26 @@ def run_plot():
     plt.close(fig2)
     print(f"[plot] time series -> {ts_path}")
 
-    # figure 3: example year side-by-side
+    # figure 3: example year side-by-side (anomalies)
     ex_idx = N_yr // 2
     ex_yr  = years_found[ex_idx]
     fig3, axes3 = plt.subplots(2, 2, figsize=(13, 9),
                                 subplot_kw={"projection": PROJ})
     fig3.suptitle(
-        f"Antarctic Reconstruction vs ERA5 -- Example Year {ex_yr} (ERA5-sampled obs)",
+        f"Antarctic Reconstruction vs ERA5 Anomaly -- Example Year {ex_yr}",
         fontsize=11)
-    t_vmin = float(true_temp_arr[ex_idx].min())
-    t_vmax = float(true_temp_arr[ex_idx].max())
-    p_vmax = float(true_prec_arr[ex_idx].max())
+    t_abs = max(abs(true_temp_arr[ex_idx]).max(),
+                abs(pred_temp_arr[ex_idx]).max())
+    p_abs = max(abs(true_prec_arr[ex_idx]).max(),
+                abs(pred_prec_arr[ex_idx]).max())
     polar_panel(axes3[0,0], to_grid(true_temp_arr[ex_idx]), lons_1d, lats_1d,
-                "RdBu_r", t_vmin, t_vmax, f"ERA5 T2m {ex_yr} (K)", "K")
+                "RdBu_r", -t_abs, t_abs, f"ERA5 T2m anomaly {ex_yr} (K)", "K")
     polar_panel(axes3[0,1], to_grid(pred_temp_arr[ex_idx]), lons_1d, lats_1d,
-                "RdBu_r", t_vmin, t_vmax, f"Predicted T2m {ex_yr} (K)", "K")
+                "RdBu_r", -t_abs, t_abs, f"Predicted T2m anomaly {ex_yr} (K)", "K")
     polar_panel(axes3[1,0], to_grid(true_prec_arr[ex_idx]), lons_1d, lats_1d,
-                "BuPu", 0, p_vmax, f"ERA5 Precip {ex_yr} (m/yr)", "m/yr", extend="max")
+                "BrBG", -p_abs, p_abs, f"ERA5 Precip anomaly {ex_yr} (m/yr)", "m/yr")
     polar_panel(axes3[1,1], to_grid(pred_prec_arr[ex_idx]), lons_1d, lats_1d,
-                "BuPu", 0, p_vmax, f"Predicted Precip {ex_yr} (m/yr)", "m/yr", extend="max")
+                "BrBG", -p_abs, p_abs, f"Predicted Precip anomaly {ex_yr} (m/yr)", "m/yr")
     fig3.tight_layout(rect=[0, 0, 1, 0.94])
     ex_path = os.path.join(OUT_DIR, f"val_example_{ex_yr}.png")
     fig3.savefig(ex_path, dpi=150, bbox_inches="tight")
@@ -463,21 +449,12 @@ def run_plot():
     print(f"[plot] example year map -> {ex_path}")
 
     print("\n[plot] all outputs written to:", OUT_DIR)
-    print("  val_metrics.npz")
-    print("  val_spatial_errors.png")
-    print("  val_timeseries.png")
-    print(f"  val_example_{ex_yr}.png")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Validate Antarctic reconstruction GNN.")
-    parser.add_argument("--phase", choices=["infer", "plot"], required=True,
-                        help="'infer': graphcast env  |  'plot': PlotEnv")
+        description="Validate Antarctic reconstruction GNN (anomaly mode).")
+    parser.add_argument("--phase", choices=["infer", "plot"], required=True)
     args = parser.parse_args()
     if args.phase == "infer":
         run_infer()

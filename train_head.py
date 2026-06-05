@@ -5,12 +5,15 @@ Approach 4: GraphCast frozen feature extractor + trainable reconstruction GNN he
 
 Architecture:
   - Bipartite graph: observation nodes (ice cores) -> target nodes (Antarctic grid)
-  - Phase 1: obs->target message passing (radius-based, ~1000km)
-  - Phase 2: target->target message passing (6 rounds, ~500km radius)
-  - Output: 2D prediction (temp + precip) at all 11,160 target nodes
+  - Phase 1: obs->target message passing (radius-based, ~1000km / 9deg)
+  - Phase 2: target->target message passing (6 rounds, ~250km / 2deg radius)
+  - Output: 2D anomaly prediction (temp + precip) at all 11,160 target nodes
+
+Anomaly mode: both obs inputs and ERA5 targets are expressed as anomalies
+relative to the 1979-2000 mean. Targets are normalised by ERA5 std only.
 
 Usage (batch job recommended):
-  python train_head.py [--epochs 200] [--lr 1e-3] [--hidden 256] [--dry-run]
+  python train_head.py [--epochs 200] [--lr 1e-3] [--hidden 128] [--dry-run]
 """
 
 import os
@@ -40,6 +43,7 @@ WEIGHTS_DIR = RECON_DIR / "weights"
 LOG_DIR     = RECON_DIR / "logs"
 
 NORM_STATS_PATH = TGT_DIR / "norm_stats.npz"
+CLIM_MEAN_PATH  = TGT_DIR / "clim_mean_1979_2000.npy"
 
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -152,6 +156,33 @@ def build_target_features(clim_emb: np.ndarray) -> np.ndarray:
 
 
 # ------------------------------------
+# Embedding similarity helper
+# ------------------------------------
+def compute_o2t_edge_sim(
+    obs_grid_indices: np.ndarray,
+    o2t_senders: np.ndarray,
+    o2t_receivers: np.ndarray,
+    clim_emb: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute cosine similarity between obs site embedding and target node
+    embedding for each obs->target edge. Shape: (n_edges, 1)
+
+    obs_grid_indices: (n_obs,) grid node index for each obs node
+    o2t_senders:     (n_edges,) obs node indices
+    o2t_receivers:   (n_edges,) target node indices
+    clim_emb:        (11160, 512) climatological mean embedding
+    """
+    obs_emb = clim_emb[obs_grid_indices[o2t_senders]]   # (n_edges, 512)
+    tgt_emb = clim_emb[o2t_receivers]                   # (n_edges, 512)
+    # cosine similarity
+    obs_norm = obs_emb / (np.linalg.norm(obs_emb, axis=1, keepdims=True) + 1e-8)
+    tgt_norm = tgt_emb / (np.linalg.norm(tgt_emb, axis=1, keepdims=True) + 1e-8)
+    sim = (obs_norm * tgt_norm).sum(axis=1, keepdims=True).astype(np.float32)
+    return sim   # (n_edges, 1)
+
+
+# ------------------------------------
 # Model definition
 # ------------------------------------
 def make_mlp(output_size: int, hidden_size: int, name: str):
@@ -169,6 +200,7 @@ def reconstruction_gnn(
     tgt_feats: jnp.ndarray,
     o2t_senders: jnp.ndarray,
     o2t_receivers: jnp.ndarray,
+    o2t_edge_sim: jnp.ndarray,
     t2t_senders: jnp.ndarray,
     t2t_receivers: jnp.ndarray,
     hidden_size: int,
@@ -183,7 +215,9 @@ def reconstruction_gnn(
     o2t_agg_mlp  = make_mlp(hidden_size, hidden_size * 2, "o2t_agg")
 
     def o2t_message_pass(obs_h, tgt_h):
-        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers]], axis=-1)
+        # include embedding cosine similarity as edge feature
+        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers],
+                                     o2t_edge_sim], axis=-1)
         messages = o2t_edge_mlp(edge_in)
         agg      = jax.ops.segment_sum(messages, o2t_receivers,
                                        num_segments=tgt_h.shape[0])
@@ -213,18 +247,24 @@ def reconstruction_gnn(
 # Dataset
 # ------------------------------------
 class ReconDataset:
-    def __init__(self, years: list[int], loader, logger: logging.Logger):
+    def __init__(self, years: list[int], loader, clim_mean: np.ndarray,
+                 logger: logging.Logger):
+        """
+        clim_mean: (11160, 2) ERA5 mean over 1979-2000, col0=T(K) col1=P(m/yr)
+        Targets are expressed as anomalies: targets_raw - clim_mean,
+        then normalised by std only.
+        """
         self.samples = []
         self.logger  = logger
         logger.info(f"Loading dataset for {len(years)} years...")
 
         norm = np.load(NORM_STATS_PATH)
-        self.temp_mean   = float(norm['temp_mean'])
-        self.temp_std    = float(norm['temp_std'])
-        self.precip_mean = float(norm['prec_mean'])
-        self.precip_std  = float(norm['prec_std'])
-        logger.info(f"  Norm stats -- T: {self.temp_mean:.1f}+/-{self.temp_std:.1f}K  "
-                    f"P: {self.precip_mean:.3f}+/-{self.precip_std:.3f} m/yr")
+        self.temp_std   = float(norm['temp_std'])
+        self.precip_std = float(norm['prec_std'])
+        logger.info(f"  Norm stats -- T std={self.temp_std:.2f}K  "
+                    f"P std={self.precip_std:.4f} m/yr")
+        logger.info(f"  Clim mean -- T={clim_mean[:,0].mean():.2f}K  "
+                    f"P={clim_mean[:,1].mean():.4f} m/yr")
 
         skipped = 0
         for yr in years:
@@ -246,10 +286,11 @@ class ReconDataset:
                 skipped += 1
                 continue
 
-            targets_raw  = np.load(tgt_path)
+            targets_raw  = np.load(tgt_path)             # (11160, 2) physical
+            targets_anom = targets_raw - clim_mean        # anomaly relative to 1979-2000
             targets_norm = np.stack([
-                (targets_raw[:, 0] - self.temp_mean)   / self.temp_std,
-                (targets_raw[:, 1] - self.precip_mean) / self.precip_std,
+                targets_anom[:, 0] / self.temp_std,
+                targets_anom[:, 1] / self.precip_std,
             ], axis=1).astype(np.float32)
 
             self.samples.append((obs, targets_norm))
@@ -292,9 +333,24 @@ def mse_loss(predictions: jnp.ndarray, targets: jnp.ndarray) -> jnp.ndarray:
     return jnp.mean((predictions - targets) ** 2)
 
 
+def spatial_variance_penalty(predictions: jnp.ndarray,
+                              lambda_var: float = 0.5) -> jnp.ndarray:
+    """Penalize spatially flat outputs. predictions: (11160, 2)
+    Uses a soft target variance: penalizes deviation from a target std
+    of 1.0 in normalised space (matching ERA5 anomaly distribution).
+    Loss = lambda * max(0, target_std - current_std)^2
+    This only activates when std is below target, never dominates when
+    std is already reasonable.
+    """
+    spatial_std = jnp.std(predictions, axis=0).mean()
+    target_std  = 1.0   # target std in normalised space
+    shortfall   = jnp.maximum(0.0, target_std - spatial_std)
+    return lambda_var * shortfall ** 2
+
+
 def make_forward_fn(hidden_size: int, n_t2t_rounds: int):
-    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, t2t_s, t2t_r):
-        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r,
+    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r):
+        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim,
                                    t2t_s, t2t_r, hidden_size, n_t2t_rounds)
     return hk.transform(_forward)
 
@@ -305,17 +361,27 @@ def make_forward_fn(hidden_size: int, n_t2t_rounds: int):
 def train(args, logger: logging.Logger):
     rng = jax.random.PRNGKey(args.seed)
 
+    # Load climatological mean for anomaly targets
+    logger.info(f"Loading ERA5 clim mean from {CLIM_MEAN_PATH}...")
+    if not CLIM_MEAN_PATH.exists():
+        logger.error(f"Clim mean not found: {CLIM_MEAN_PATH}")
+        logger.error("Run: python3 -c \"import numpy as np, os; ..."
+                     "\" to generate it first.")
+        sys.exit(1)
+    clim_mean = np.load(CLIM_MEAN_PATH)   # (11160, 2)
+    logger.info(f"  Clim mean shape: {clim_mean.shape}  "
+                f"T={clim_mean[:,0].mean():.2f}K  P={clim_mean[:,1].mean():.4f}m/yr")
+
     # Initialise ice core loader
     logger.info("Initialising IceCoreLoader...")
     from ice_core_loader import IceCoreLoader
+    ns = np.load(NORM_STATS_PATH)
     loader = IceCoreLoader(
-        temp_mean=float(np.load(NORM_STATS_PATH)['temp_mean']),
-        temp_std=float(np.load(NORM_STATS_PATH)['temp_std']),
-        prec_mean=float(np.load(NORM_STATS_PATH)['prec_mean']),
-        prec_std=float(np.load(NORM_STATS_PATH)['prec_std']),
         data_dir        = str(RECON_DIR / "data"),
         embeddings_dir  = str(EMB_DIR),
         calibration_dir = str(CALIB_DIR),
+        temp_mean=float(ns['temp_mean']), temp_std=float(ns['temp_std']),
+        prec_mean=float(ns['prec_mean']), prec_std=float(ns['prec_std']),
     )
 
     # Build target features using full-grid clim embedding from loader
@@ -332,7 +398,7 @@ def train(args, logger: logging.Logger):
 
     # Dataset
     years   = TRAIN_YEARS[:3] if args.dry_run else TRAIN_YEARS
-    dataset = ReconDataset(years, loader, logger)
+    dataset = ReconDataset(years, loader, clim_mean, logger)
     if len(dataset) == 0:
         logger.error("No training samples -- aborting.")
         return
@@ -348,10 +414,14 @@ def train(args, logger: logging.Logger):
     )
     o2t_s0 = jnp.array(o2t_s0_np)
     o2t_r0 = jnp.array(o2t_r0_np)
+    o2t_sim0 = jnp.array(compute_o2t_edge_sim(
+        obs0['grid_indices'], o2t_s0_np, o2t_r0_np,
+        loader.clim_embedding
+    ))
 
     rng, init_rng = jax.random.split(rng)
     params = forward.init(init_rng, obs_feats0, tgt_feats,
-                          o2t_s0, o2t_r0, t2t_s, t2t_r)
+                          o2t_s0, o2t_r0, o2t_sim0, t2t_s, t2t_r)
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     logger.info(f"  Model parameters: {n_params:,}")
 
@@ -370,10 +440,11 @@ def train(args, logger: logging.Logger):
     opt_state = optimiser.init(params)
 
     @jax.jit
-    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r):
+    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r,
+                   o2t_sim):
         def loss_fn(p):
             preds = forward.apply(p, None, obs_feats, tgt_feats,
-                                  o2t_s, o2t_r, t2t_s, t2t_r)
+                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
             return mse_loss(preds, tgt_targets)
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = optimiser.update(grads, opt_state, params)
@@ -405,24 +476,28 @@ def train(args, logger: logging.Logger):
         for step, idx in enumerate(indices):
             obs, targets_norm = dataset[idx]
 
-            # Features come directly from loader -- no build_obs_features needed
-            obs_feats_np = obs['features']   # (N_obs, 518)
+            obs_feats_np = obs['features']   # (N_obs, 518) anomaly features
             o2t_s_np, o2t_r_np = build_obs_to_target_edges(
                 obs['lats'], obs['lons'],
                 TARGET_LATS, TARGET_LONS, OBS_TO_TGT_RADIUS_DEG,
+            )
+            o2t_sim_np = compute_o2t_edge_sim(
+                obs['grid_indices'], o2t_s_np, o2t_r_np,
+                loader.clim_embedding
             )
 
             obs_feats   = jnp.array(obs_feats_np)
             tgt_targets = jnp.array(targets_norm)
             o2t_s       = jnp.array(o2t_s_np)
             o2t_r       = jnp.array(o2t_r_np)
+            o2t_sim     = jnp.array(o2t_sim_np)
 
             params, opt_state, loss = train_step(
-                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r
+                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r, o2t_sim
             )
             epoch_loss += float(loss)
 
-            if args.dry_run and step >= 99:
+            if args.dry_run and step >= 1:
                 logger.info("  [DRY RUN] stopping after 2 steps")
                 break
 
@@ -439,7 +514,6 @@ def train(args, logger: logging.Logger):
             logger.info(f"  New best loss: {best_loss:.5f}")
         elif epoch % 10 == 0:
             save_checkpoint(params, epoch, avg_loss)
-
 
     # Save final weights
     final_path = WEIGHTS_DIR / "weights_final.npz"
@@ -468,7 +542,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train Antarctic reconstruction GNN head")
     parser.add_argument("--epochs",     type=int,   default=200)
     parser.add_argument("--lr",         type=float, default=1e-3)
-    parser.add_argument("--hidden",     type=int,   default=256)
+    parser.add_argument("--hidden",     type=int,   default=128)
     parser.add_argument("--t2t-rounds", type=int,   default=6)
     parser.add_argument("--seed",       type=int,   default=42)
     parser.add_argument("--dry-run",    action="store_true")
@@ -478,13 +552,14 @@ def main():
     logger = setup_logging(log_path)
 
     logger.info("=" * 60)
-    logger.info("Antarctic Reconstruction GNN -- Training")
+    logger.info("Antarctic Reconstruction GNN -- Training (anomaly mode)")
     logger.info(f"  JAX devices: {jax.devices()}")
     logger.info(f"  Args: {vars(args)}")
     logger.info("=" * 60)
 
     for path, desc in [
-        (NORM_STATS_PATH,          "normalisation stats"),
+        (NORM_STATS_PATH,                "normalisation stats"),
+        (CLIM_MEAN_PATH,                 "ERA5 climatological mean"),
         (EMB_DIR / "embedding_clim.npy", "climatological embedding"),
         (CALIB_DIR / "calibrated_iso.npy",   "calibrated isotope data"),
         (CALIB_DIR / "calibrated_accum.npy", "calibrated accum data"),

@@ -348,34 +348,33 @@ def calibrate(args, logger: logging.Logger):
             logger.warning(f"  ACCUM {sid}: no data column, skipping")
             continue
 
+        # Direct conversion: raw mm w.e./yr -> m w.e./yr (no regression)
+        # OLS regression is scale-invariant so regressing against ERA5 adds
+        # no information here -- the raw/1000 values are already in ERA5 units.
+        full_series = np.full(n_recon, np.nan, dtype=np.float32)
+        n_valid = 0
+        for j, yr in enumerate(recon_years):
+            idx = np.where(accum_years == yr)[0]
+            if len(idx) > 0:
+                full_series[j] = raw_series[idx[0]] / 1000.0  # mm w.e./yr -> m w.e./yr
+
+        # compute R2 against ERA5 for uncertainty estimation only
+        # (regression coefficients are NOT used for calibrated values)
         accum_overlap = np.full(len(overlap_years), np.nan, dtype=np.float32)
         for j, yr in enumerate(overlap_years):
             idx = np.where(accum_years == yr)[0]
             if len(idx) > 0:
-                accum_overlap[j] = raw_series[idx[0]]
-
-        n_obs = int(np.sum(np.isfinite(accum_overlap)))
+                accum_overlap[j] = raw_series[idx[0]] / 1000.0
         _, era5_precip = load_era5_at_node(node_idx, overlap_years)
-
         slope, intercept, r2, n_valid = linear_regression(accum_overlap, era5_precip)
-        accum_slopes[i]     = slope
-        accum_intercepts[i] = intercept
-        accum_r2[i]         = r2
-        accum_n[i]          = n_valid
+        accum_r2[i] = r2 if not np.isnan(r2) else 0.0
+        accum_n[i]  = n_valid
 
-        if np.isnan(slope):
-            logger.warning(f"  ACCUM {sid}: regression failed (n_ice={n_obs}, n_valid={n_valid})")
-            continue
+        accum_calib_ts[i] = full_series  # direct conversion, no regression applied
 
-        logger.info(f"  ACCUM {sid}: slope={slope:.4f}, intercept={intercept:.4f}, "
-                    f"r2={r2:.3f}, n={n_valid}")
-
-        full_series = np.full(n_recon, np.nan, dtype=np.float32)
-        for j, yr in enumerate(recon_years):
-            idx = np.where(accum_years == yr)[0]
-            if len(idx) > 0:
-                full_series[j] = raw_series[idx[0]]
-        accum_calib_ts[i] = apply_regression(full_series, slope, intercept)
+        logger.info(f"  ACCUM {sid}: direct conversion raw/1000, "
+                    f"r2={accum_r2[i]:.3f}, n={n_valid}, "
+                    f"mean={float(np.nanmean(full_series)):.4f} m/yr")
 
         if args.dry_run and i >= 4:
             logger.info("  [DRY RUN] stopping after 5 accum sites")

@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N calibrate
+#PBS -q main
+#PBS -l select=1:ncpus=8:mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -A P93300301
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/calibrate.out
+#PBS -e /glade/derecho/scratch/advike/graphcast_recon/logs/calibrate.err
+
+cd /glade/derecho/scratch/advike/graphcast_recon
+
+module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+python calibrate_ice_cores.py
