@@ -17,4 +17,4 @@ conda activate graphcast
 export TF_GPU_ALLOCATOR=cuda_malloc_async
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.85
 
-python train_head.py --epochs 50 --dry-run --lr 1e-3 --hidden 128 
+python train_head.py --epochs 200 --lr 1e-3 --hidden 128 

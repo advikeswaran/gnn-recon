@@ -114,13 +114,6 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
 
     obs_grid_indices = obs["grid_indices"]   # (n_obs,) int32
 
-    # precompute embedding similarity for obs->target edges
-    o2t_sim_np = compute_o2t_edge_sim(
-        obs_grid_indices, o2t_s_np, o2t_r_np,
-        loader.clim_embedding
-    )
-    o2t_sim = jnp.array(o2t_sim_np)
-
     iso_node_std   = np.zeros(n_obs, dtype=np.float32)
     accum_node_std = np.zeros(n_obs, dtype=np.float32)
 
@@ -164,7 +157,7 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
         pred_norm = forward.apply(
             params, None,
             jnp.array(obs_feats_perturbed), tgt_feats,
-            o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r,
+            o2t_s, o2t_r, t2t_s, t2t_r,
         )
         ensemble_preds[e] = np.array(pred_norm)
 
@@ -172,19 +165,23 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
     pred_mean_norm = ensemble_preds.mean(axis=0)   # (11160, 2)
     pred_std_norm  = ensemble_preds.std(axis=0)    # (11160, 2)
 
-    # denormalise: model outputs anomalies normalised by anom_std
+    # denormalise: model outputs anomalies normalised by ERA5 anomaly std
     # add clim_mean to convert anomalies to physical units
     clim_mean = np.load(
         os.path.join(CACHE_DIR, "era5_targets", "clim_mean_1979_2000.npy")
     )  # (11160, 2)
+    era5_anom     = np.load(os.path.join(CACHE_DIR, "era5_targets",
+                                         "anom_std_1979_2000.npz"))
+    era5_temp_std = float(era5_anom["temp_anom_std"])
+    era5_prec_std = float(era5_anom["prec_anom_std"])
     pred_mean = np.stack([
-        pred_mean_norm[:, 0] * loader.iso_anom_std   + clim_mean[:, 0],
-        pred_mean_norm[:, 1] * loader.accum_anom_std + clim_mean[:, 1],
+        pred_mean_norm[:, 0] * era5_temp_std + clim_mean[:, 0],
+        pred_mean_norm[:, 1] * era5_prec_std + clim_mean[:, 1],
     ], axis=1).astype(np.float32)
 
     pred_std = np.stack([
-        pred_std_norm[:, 0] * loader.iso_anom_std,
-        pred_std_norm[:, 1] * loader.accum_anom_std,
+        pred_std_norm[:, 0] * era5_temp_std,
+        pred_std_norm[:, 1] * era5_prec_std,
     ], axis=1).astype(np.float32)
 
     # -- atomic save ----------------------------------------------------------
@@ -211,7 +208,6 @@ def main():
         build_obs_to_target_edges,
         build_target_features,
         make_forward_fn,
-        compute_o2t_edge_sim,
         TARGET_LATS,
         TARGET_LONS,
     )
@@ -273,12 +269,10 @@ def main():
 
     # init with dummy inputs to get pytree structure
     dummy_obs = jnp.zeros((135, 518), dtype=jnp.float32)   # 135 = typical n_obs
-    dummy_o2t_s   = jnp.zeros(1, dtype=jnp.int32)
-    dummy_o2t_r   = jnp.zeros(1, dtype=jnp.int32)
-    dummy_o2t_sim = jnp.zeros((1, 1), dtype=jnp.float32)
+    dummy_o2t_s = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_r = jnp.zeros(1, dtype=jnp.int32)
     params = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
-                          dummy_o2t_s, dummy_o2t_r, dummy_o2t_sim,
-                          t2t_s, t2t_r)
+                          dummy_o2t_s, dummy_o2t_r, t2t_s, t2t_r)
 
     weights_path = os.path.join(RECON_DIR, "weights", "weights_final.npz")
     raw    = np.load(weights_path)

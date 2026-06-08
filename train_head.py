@@ -42,8 +42,9 @@ CALIB_DIR   = CACHE_DIR / "calibration"
 WEIGHTS_DIR = RECON_DIR / "weights"
 LOG_DIR     = RECON_DIR / "logs"
 
-NORM_STATS_PATH = TGT_DIR / "norm_stats.npz"
-CLIM_MEAN_PATH  = TGT_DIR / "clim_mean_1979_2000.npy"
+NORM_STATS_PATH    = TGT_DIR / "norm_stats.npz"
+CLIM_MEAN_PATH     = TGT_DIR / "clim_mean_1979_2000.npy"
+ANOM_STD_PATH      = TGT_DIR / "anom_std_1979_2000.npz"
 
 WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -200,7 +201,6 @@ def reconstruction_gnn(
     tgt_feats: jnp.ndarray,
     o2t_senders: jnp.ndarray,
     o2t_receivers: jnp.ndarray,
-    o2t_edge_sim: jnp.ndarray,
     t2t_senders: jnp.ndarray,
     t2t_receivers: jnp.ndarray,
     hidden_size: int,
@@ -215,9 +215,7 @@ def reconstruction_gnn(
     o2t_agg_mlp  = make_mlp(hidden_size, hidden_size * 2, "o2t_agg")
 
     def o2t_message_pass(obs_h, tgt_h):
-        # include embedding cosine similarity as edge feature
-        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers],
-                                     o2t_edge_sim], axis=-1)
+        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers]], axis=-1)
         messages = o2t_edge_mlp(edge_in)
         agg      = jax.ops.segment_sum(messages, o2t_receivers,
                                        num_segments=tgt_h.shape[0])
@@ -258,11 +256,11 @@ class ReconDataset:
         self.logger  = logger
         logger.info(f"Loading dataset for {len(years)} years...")
 
-        norm = np.load(NORM_STATS_PATH)
-        self.temp_std   = float(norm['temp_std'])
-        self.precip_std = float(norm['prec_std'])
-        logger.info(f"  Norm stats -- T std={self.temp_std:.2f}K  "
-                    f"P std={self.precip_std:.4f} m/yr")
+        anom_std = np.load(ANOM_STD_PATH)
+        self.temp_std   = float(anom_std['temp_anom_std'])
+        self.precip_std = float(anom_std['prec_anom_std'])
+        logger.info(f"  Anomaly stds -- T={self.temp_std:.4f}K  "
+                    f"P={self.precip_std:.4f} m/yr")
         logger.info(f"  Clim mean -- T={clim_mean[:,0].mean():.2f}K  "
                     f"P={clim_mean[:,1].mean():.4f} m/yr")
 
@@ -349,8 +347,8 @@ def spatial_variance_penalty(predictions: jnp.ndarray,
 
 
 def make_forward_fn(hidden_size: int, n_t2t_rounds: int):
-    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r):
-        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim,
+    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, t2t_s, t2t_r):
+        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r,
                                    t2t_s, t2t_r, hidden_size, n_t2t_rounds)
     return hk.transform(_forward)
 
@@ -414,14 +412,10 @@ def train(args, logger: logging.Logger):
     )
     o2t_s0 = jnp.array(o2t_s0_np)
     o2t_r0 = jnp.array(o2t_r0_np)
-    o2t_sim0 = jnp.array(compute_o2t_edge_sim(
-        obs0['grid_indices'], o2t_s0_np, o2t_r0_np,
-        loader.clim_embedding
-    ))
 
     rng, init_rng = jax.random.split(rng)
     params = forward.init(init_rng, obs_feats0, tgt_feats,
-                          o2t_s0, o2t_r0, o2t_sim0, t2t_s, t2t_r)
+                          o2t_s0, o2t_r0, t2t_s, t2t_r)
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     logger.info(f"  Model parameters: {n_params:,}")
 
@@ -440,11 +434,10 @@ def train(args, logger: logging.Logger):
     opt_state = optimiser.init(params)
 
     @jax.jit
-    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r,
-                   o2t_sim):
+    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r):
         def loss_fn(p):
             preds = forward.apply(p, None, obs_feats, tgt_feats,
-                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
+                                  o2t_s, o2t_r, t2t_s, t2t_r)
             return mse_loss(preds, tgt_targets)
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = optimiser.update(grads, opt_state, params)
@@ -481,19 +474,14 @@ def train(args, logger: logging.Logger):
                 obs['lats'], obs['lons'],
                 TARGET_LATS, TARGET_LONS, OBS_TO_TGT_RADIUS_DEG,
             )
-            o2t_sim_np = compute_o2t_edge_sim(
-                obs['grid_indices'], o2t_s_np, o2t_r_np,
-                loader.clim_embedding
-            )
 
             obs_feats   = jnp.array(obs_feats_np)
             tgt_targets = jnp.array(targets_norm)
             o2t_s       = jnp.array(o2t_s_np)
             o2t_r       = jnp.array(o2t_r_np)
-            o2t_sim     = jnp.array(o2t_sim_np)
 
             params, opt_state, loss = train_step(
-                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r, o2t_sim
+                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r
             )
             epoch_loss += float(loss)
 

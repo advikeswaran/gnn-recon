@@ -39,7 +39,6 @@ def run_infer():
         build_obs_to_target_edges,
         build_target_features,
         make_forward_fn,
-        compute_o2t_edge_sim,
         TARGET_LATS,
         TARGET_LONS,
     )
@@ -104,18 +103,11 @@ def run_infer():
     o2t_r = jnp.array(o2t_r_np)
     print(f"[infer] o2t edges: {o2t_s.shape[0]:,}")
 
-    # precompute embedding similarity for static obs->target edges
-    o2t_sim_np = compute_o2t_edge_sim(
-        np.array(obs_grid_indices), o2t_s_np, o2t_r_np,
-        loader.clim_embedding
-    )
-    o2t_sim = jnp.array(o2t_sim_np)
-
     # ── model + weights ───────────────────────────────────────────────────────
     forward = make_forward_fn(HIDDEN, T2T_ROUNDS)
     dummy_obs = jnp.zeros((n_obs, 518), dtype=jnp.float32)
     params    = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
-                             o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
+                             o2t_s, o2t_r, t2t_s, t2t_r)
     raw    = np.load(os.path.join(RECON_DIR, "weights", "weights_final.npz"))
     leaves = [raw[str(i)] for i in range(len(raw.files))]
     params = jax.tree_util.tree_unflatten(
@@ -180,7 +172,7 @@ def run_infer():
 
         print(f"[infer] {yr}: running forward pass ...")
         pred_norm = forward.apply(params, None, obs_feats_jnp, tgt_feats,
-                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
+                                  o2t_s, o2t_r, t2t_s, t2t_r)
         pred_norm = np.array(pred_norm)  # (11160, 2) normalised anomalies
 
         tmp = out_path.replace(".npy", ".tmp.npy")
@@ -206,10 +198,13 @@ def run_plot():
     temp_std  = float(ns["temp_std"])
     prec_std  = float(ns["prec_std"])
 
-    # load anomaly stds used for obs normalisation during training
-    anom_stds      = np.load(os.path.join(CACHE_DIR, "calibration", "anom_stds.npz"))
-    iso_anom_std   = float(anom_stds["iso_anom_std"])
-    accum_anom_std = float(anom_stds["accum_anom_std"])
+    # load anomaly stds
+    anom_stds          = np.load(os.path.join(CACHE_DIR, "calibration", "anom_stds.npz"))
+    iso_anom_std       = float(anom_stds["iso_anom_std"])
+    accum_anom_std     = float(anom_stds["accum_anom_std"])
+    era5_anom          = np.load(os.path.join(CACHE_DIR, "era5_targets", "anom_std_1979_2000.npz"))
+    era5_temp_anom_std = float(era5_anom["temp_anom_std"])
+    era5_prec_anom_std = float(era5_anom["prec_anom_std"])
 
     # clim mean for converting targets to anomalies
     clim_mean = np.load(
@@ -241,9 +236,9 @@ def run_plot():
         pred_norm = np.load(pred_path)   # (11160, 2) normalised anomalies
         tgt       = np.load(tgt_path)    # (11160, 2) physical
 
-        # denormalise predictions: model outputs normalised by anom_std
-        pred_temp_anom = pred_norm[:, 0] * iso_anom_std    # K anomaly
-        pred_prec_anom = pred_norm[:, 1] * accum_anom_std  # m/yr anomaly
+        # denormalise predictions: model outputs normalised by ERA5 anomaly std
+        pred_temp_anom = pred_norm[:, 0] * era5_temp_anom_std   # K anomaly
+        pred_prec_anom = pred_norm[:, 1] * era5_prec_anom_std   # m/yr anomaly
 
         # convert targets to anomalies
         true_temp_anom = tgt[:, 0] - clim_mean[:, 0]   # K anomaly
