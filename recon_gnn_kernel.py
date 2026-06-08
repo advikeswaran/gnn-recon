@@ -260,7 +260,7 @@ def train(args, logger):
     obs_grid   = np.array(all_grid, dtype=np.int32)
 
     logger.info("Building mesh...")
-    mesh_lats, mesh_lons, ms_np, mr_np = build_icosahedral_mesh(4)
+    mesh_lats, mesh_lons, ms_np, mr_np = build_icosahedral_mesh(args.refinements)
     n_mesh = len(mesh_lats)
     mesh_pos_np = norm_pos(mesh_lats, mesh_lons)
     logger.info(f"  {n_mesh} nodes")
@@ -346,15 +346,20 @@ def train(args, logger):
         updates, new_opt = opt.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), new_opt, loss
 
-    # validation sample
-    val_era5  = np.load(TGT_DIR/"targets_2001.npy")
-    val_anom  = val_era5 - clim_mean
-    val_t_obs = (val_anom[obs_grid[:n_iso],0]/t_std).astype(np.float32)
-    val_p_obs = (val_anom[obs_grid[n_iso:],1]/p_std).astype(np.float32)
-    val_t_tgt = (val_anom[:,0]/t_std).astype(np.float32)
-    val_p_tgt = (val_anom[:,1]/p_std).astype(np.float32)
+    # load all 5 validation years
+    val_samples = []
+    for val_yr in [2001, 2002, 2003, 2004, 2005]:
+        ve  = np.load(TGT_DIR/f"targets_{val_yr}.npy")
+        va  = ve - clim_mean
+        val_samples.append((
+            (va[obs_grid[:n_iso],  0]/t_std).astype(np.float32),
+            (va[obs_grid[n_iso:],  1]/p_std).astype(np.float32),
+            (va[:,0]/t_std).astype(np.float32),
+            (va[:,1]/p_std).astype(np.float32),
+        ))
+    logger.info(f"  {len(val_samples)} validation years: 2001-2005")
 
-    best_T = best_P = best_val = float('inf')
+    best_val = float('inf')
 
     for epoch in range(1, args.epochs+1):
         t0 = time.time()
@@ -371,26 +376,33 @@ def train(args, logger):
             if args.dry_run and i >= 1: break
         avg_T = tl/len(idx); avg_P = pl/len(idx)
 
-        if epoch % 50 == 0 or epoch <= 5:
-            # validation
-            val_pred_T = np.array(fwd_T.apply(params_T, None, jnp.array(val_t_obs), ms, mr))
-            val_pred_P = np.array(fwd_P.apply(params_P, None, jnp.array(val_p_obs), ms, mr))
-            vl_T = float(np.mean((val_pred_T - val_t_tgt)**2))
-            vl_P = float(np.mean((val_pred_P - val_p_tgt)**2))
-            r_T  = float(np.corrcoef(val_pred_T, val_t_tgt)[0,1])
+        # validate every epoch
+        vl_T_all = vl_P_all = r_T_all = 0.
+        for vt_obs, vp_obs, vt_tgt, vp_tgt in val_samples:
+            vp_T = np.array(fwd_T.apply(params_T, None, jnp.array(vt_obs), ms, mr))
+            vp_P = np.array(fwd_P.apply(params_P, None, jnp.array(vp_obs), ms, mr))
+            vl_T_all += float(np.mean((vp_T - vt_tgt)**2))
+            vl_P_all += float(np.mean((vp_P - vp_tgt)**2))
+            r_T_all  += float(np.corrcoef(vp_T, vt_tgt)[0,1])
+        vl_T = vl_T_all / len(val_samples)
+        vl_P = vl_P_all / len(val_samples)
+        r_T  = r_T_all  / len(val_samples)
+        vl   = (vl_T + vl_P) / 2
+
+        if epoch % 10 == 0 or epoch <= 5:
             logger.info(f"Epoch {epoch:4d} | train T={avg_T:.4f} P={avg_P:.4f} | "
                        f"val T={vl_T:.4f} P={vl_P:.4f} | T_r={r_T:.3f} | "
                        f"t={time.time()-t0:.1f}s")
-            vl = (vl_T + vl_P) / 2
-            if vl < best_val:
-                best_val = vl
-                flat_T = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_T)))}
-                flat_P = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_P)))}
-                np.savez_compressed(str(WEIGHTS_DIR/"best_T.npz"), **flat_T)
-                np.savez_compressed(str(WEIGHTS_DIR/"best_P.npz"), **flat_P)
-                logger.info(f"  Best val: {best_val:.4f}")
 
-    logger.info(f"Done.")
+        if vl < best_val:
+            best_val = vl
+            flat_T = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_T)))}
+            flat_P = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_P)))}
+            np.savez_compressed(str(WEIGHTS_DIR/"best_T.npz"), **flat_T)
+            np.savez_compressed(str(WEIGHTS_DIR/"best_P.npz"), **flat_P)
+            logger.info(f"  Best val: {best_val:.4f} (epoch {epoch})")
+
+    logger.info(f"Done. Best val: {best_val:.4f}")
 
 
 def main():
@@ -401,6 +413,7 @@ def main():
     p.add_argument("--kernel-dim",  type=int,   default=16)
     p.add_argument("--mesh-rounds", type=int,   default=3)
     p.add_argument("--noise-var",   type=float, default=0.1)
+    p.add_argument("--refinements", type=int,   default=4)
     p.add_argument("--dry-run",     action="store_true")
     args = p.parse_args()
 
