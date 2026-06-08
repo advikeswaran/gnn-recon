@@ -137,11 +137,11 @@ def run_infer():
         era5_yr = np.load(tgt_path)  # (11160, 2)
 
         iso_obs_norm = np.array(
-            [(era5_yr[g, 0] - clim_mean[g, 0]) / loader.iso_anom_std
+            [(era5_yr[g, 0] - clim_mean[g, 0]) / era5_temp_anom_std
              for g in iso_grid_indices],
             dtype=np.float32)
         accum_obs_norm = np.array(
-            [(era5_yr[g, 1] - clim_mean[g, 1]) / loader.accum_anom_std
+            [(era5_yr[g, 1] - clim_mean[g, 1]) / era5_prec_anom_std
              for g in accum_grid_indices],
             dtype=np.float32)
 
@@ -150,7 +150,7 @@ def run_infer():
               f"P anom norm [{accum_obs_norm.min():.3f}, "
               f"{accum_obs_norm.max():.3f}]")
 
-        # assemble 518-dim obs features matching IceCoreLoader anomaly layout
+        # assemble 518-dim obs features matching training layout
         obs_feats_list = []
         for k, g in enumerate(iso_grid_indices):
             feat = np.concatenate([

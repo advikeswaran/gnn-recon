@@ -131,10 +131,20 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
                             for sid in loader.accum_grid_map[g]]
             accum_node_std[k] = float(np.mean(accum_resid_std[site_indices]))
 
+    # load ERA5 anomaly stds to match training normalisation
+    era5_anom_f    = np.load(os.path.join(CACHE_DIR, "era5_targets",
+                                          "anom_std_1979_2000.npz"))
+    era5_t_std     = float(era5_anom_f["temp_anom_std"])
+    era5_p_std     = float(era5_anom_f["prec_anom_std"])
+
+    # normalise obs features to match training (ERA5 anom std)
+    # training X: ERA5_anom / era5_t_std; reconstruction X: proxy_anom / era5_t_std
+    obs_feats_base[:, 0] = obs_feats_base[:, 0] * loader.iso_anom_std / era5_t_std
+    obs_feats_base[:, 2] = obs_feats_base[:, 2] * loader.accum_anom_std / era5_p_std
+
     # Convert residual stds to normalised space for perturbation
-    # normalise perturbations by anom_std to match training obs scale
-    iso_node_std_norm   = iso_node_std   / loader.iso_anom_std    # (n_obs,)
-    accum_node_std_norm = accum_node_std / loader.accum_anom_std  # (n_obs,)
+    iso_node_std_norm   = iso_node_std   / era5_t_std    # (n_obs,)
+    accum_node_std_norm = accum_node_std / era5_p_std    # (n_obs,)
 
     # -- ensemble forward passes ----------------------------------------------
     ensemble_preds = np.zeros((N_ENSEMBLE, 11160, 2), dtype=np.float32)

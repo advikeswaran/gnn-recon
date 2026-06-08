@@ -291,6 +291,22 @@ class ReconDataset:
                 targets_anom[:, 1] / self.precip_std,
             ], axis=1).astype(np.float32)
 
+            # Replace ice core proxy obs with ERA5 values at obs grid nodes.
+            # This trains the GNN as a pure spatial interpolator: given the
+            # true ERA5 values at 135 locations, reconstruct the full field.
+            # At reconstruction time, ice core proxy values are substituted.
+            obs_feats = obs['features'].copy()
+            grid_indices = obs['grid_indices']
+            for k, g in enumerate(grid_indices):
+                # iso channel (col 0): ERA5 T anomaly normalised by temp_std
+                if obs_feats[k, 1] > 0:  # iso available at this node
+                    obs_feats[k, 0] = targets_anom[g, 0] / self.temp_std
+                # accum channel (col 2): ERA5 P anomaly normalised by precip_std
+                if obs_feats[k, 3] > 0:  # accum available at this node
+                    obs_feats[k, 2] = targets_anom[g, 1] / self.precip_std
+            obs = dict(obs)
+            obs['features'] = obs_feats
+
             self.samples.append((obs, targets_norm))
 
         logger.info(f"  Dataset: {len(self.samples)} samples loaded, {skipped} skipped")

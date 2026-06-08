@@ -163,9 +163,20 @@ class IceCoreLoader:
         self.accum_site_to_row = {sid: i
                                    for i, sid in enumerate(self.calib_accum_site_ids)}
 
+        # load R2 values for SNR weighting: w = R2 / (1 - R2)
+        coeffs = np.load(self.calibration_dir / 'coefficients.npz')
+        iso_r2   = np.clip(coeffs['iso_r2'].astype(np.float32),   0.0, 0.999)
+        accum_r2 = np.clip(coeffs['accum_r2'].astype(np.float32), 0.0, 0.999)
+        self.iso_snr_weight   = iso_r2   / (1.0 - iso_r2)
+        self.accum_snr_weight = accum_r2 / (1.0 - accum_r2)
+
         print(f"  Calibration: {len(self.calib_iso_site_ids)} iso sites, "
               f"{len(self.calib_accum_site_ids)} accum sites, "
               f"years {self.calib_years[0]}-{self.calib_years[-1]}")
+        print(f"  SNR weights: iso mean={self.iso_snr_weight.mean():.3f} "
+              f"max={self.iso_snr_weight.max():.3f} | "
+              f"accum mean={self.accum_snr_weight.mean():.3f} "
+              f"max={self.accum_snr_weight.max():.3f}")
 
     def _compute_overlap_means(self):
         """
@@ -264,7 +275,6 @@ class IceCoreLoader:
                 anoms.append(float(v) - float(mean))
         if not anoms:
             return 0.0, False
-        # divide by std only — anomalies are already centered near zero
         norm_val = float(np.mean(anoms)) / self.iso_anom_std
         return norm_val, True
 
