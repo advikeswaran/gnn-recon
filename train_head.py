@@ -54,7 +54,7 @@ sys.path.insert(0, str(RECON_DIR))
 # ------------------------------------
 # Constants
 # ------------------------------------
-TRAIN_YEARS    = list(range(1979, 2001))
+TRAIN_YEARS    = list(range(1979, 2001)) + list(range(2006, 2018))
 N_TARGET_NODES = 11_160
 N_OUTPUT       = 2
 
@@ -64,7 +64,7 @@ TARGET_LATS, TARGET_LONS = np.meshgrid(LAT_VALS, LON_VALS, indexing='ij')
 TARGET_LATS = TARGET_LATS.reshape(-1)
 TARGET_LONS = TARGET_LONS.reshape(-1)
 
-OBS_TO_TGT_RADIUS_DEG = 9.0
+OBS_TO_TGT_RADIUS_DEG = 45.0
 TGT_TO_TGT_RADIUS_DEG = 2.0
 
 # ------------------------------------
@@ -196,18 +196,29 @@ def make_mlp(output_size: int, hidden_size: int, name: str):
     ], name=name)
 
 
+def make_mlp_no_ln(output_size: int, hidden_size: int, name: str):
+    """MLP without LayerNorm -- preserves magnitude of input signal."""
+    return hk.Sequential([
+        hk.Linear(hidden_size, name=f"{name}_l1"), jax.nn.relu,
+        hk.Linear(hidden_size, name=f"{name}_l2"), jax.nn.relu,
+        hk.Linear(output_size, name=f"{name}_out"),
+    ], name=name)
+
+
 def reconstruction_gnn(
     obs_feats: jnp.ndarray,
     tgt_feats: jnp.ndarray,
     o2t_senders: jnp.ndarray,
     o2t_receivers: jnp.ndarray,
+    o2t_edge_sim: jnp.ndarray,
     t2t_senders: jnp.ndarray,
     t2t_receivers: jnp.ndarray,
     hidden_size: int,
     n_t2t_rounds: int,
 ) -> jnp.ndarray:
     # 1. Encode
-    obs_enc = make_mlp(hidden_size, hidden_size * 2, "obs_encoder")(obs_feats)
+    # obs_encoder has no LayerNorm to preserve the magnitude of the obs signal
+    obs_enc = make_mlp_no_ln(hidden_size, hidden_size * 2, "obs_encoder")(obs_feats)
     tgt_enc = make_mlp(hidden_size, hidden_size * 2, "tgt_encoder")(tgt_feats)
 
     # 2. Obs -> Target
@@ -215,10 +226,28 @@ def reconstruction_gnn(
     o2t_agg_mlp  = make_mlp(hidden_size, hidden_size * 2, "o2t_agg")
 
     def o2t_message_pass(obs_h, tgt_h):
-        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers]], axis=-1)
+        # compute messages with embedding similarity as edge feature
+        edge_in  = jnp.concatenate([obs_h[o2t_senders], tgt_h[o2t_receivers],
+                                     o2t_edge_sim], axis=-1)
         messages = o2t_edge_mlp(edge_in)
-        agg      = jax.ops.segment_sum(messages, o2t_receivers,
-                                       num_segments=tgt_h.shape[0])
+
+        # attention-weighted aggregation using embedding similarity
+        # sharp softmax (temperature=0.1) to concentrate weights on
+        # most-similar obs rather than averaging uniformly over all 135
+        TEMPERATURE = 0.1
+        raw_weights = o2t_edge_sim[:, 0] / TEMPERATURE  # sharpen distribution
+        # stable softmax per target node (subtract max for numerical stability)
+        max_weights = jax.ops.segment_max(raw_weights, o2t_receivers,
+                                          num_segments=tgt_h.shape[0])
+        exp_weights = jnp.exp(raw_weights - max_weights[o2t_receivers])
+        weight_sum  = jax.ops.segment_sum(exp_weights, o2t_receivers,
+                                          num_segments=tgt_h.shape[0])
+        norm_weights = exp_weights / (weight_sum[o2t_receivers] + 1e-8)
+
+        # weighted sum of messages
+        weighted_messages = messages * norm_weights[:, None]  # (n_edges, hidden)
+        agg = jax.ops.segment_sum(weighted_messages, o2t_receivers,
+                                  num_segments=tgt_h.shape[0])
         return o2t_agg_mlp(jnp.concatenate([tgt_h, agg], axis=-1))
 
     tgt_h = o2t_message_pass(obs_enc, tgt_enc)
@@ -238,7 +267,13 @@ def reconstruction_gnn(
         tgt_h = t2t_round(tgt_h)
 
     # 4. Decode
-    return hk.Linear(N_OUTPUT, name="decoder")(tgt_h)
+    # initialise decoder weights near zero so model starts near zero prediction
+    # rather than random large values -- avoids spending training budget
+    # collapsing from MSE~35 to MSE~1 before learning spatial interpolation
+    decoder = hk.Linear(N_OUTPUT, name="decoder",
+                        w_init=hk.initializers.TruncatedNormal(stddev=0.01),
+                        b_init=jnp.zeros)
+    return decoder(tgt_h)
 
 
 # ------------------------------------
@@ -272,18 +307,6 @@ class ReconDataset:
                 skipped += 1
                 continue
 
-            try:
-                obs = loader.get_year(yr)
-            except ValueError as e:
-                logger.warning(f"  Year {yr}: {e}, skipping")
-                skipped += 1
-                continue
-
-            if obs['n_obs'] == 0:
-                logger.warning(f"  Year {yr}: no obs nodes, skipping")
-                skipped += 1
-                continue
-
             targets_raw  = np.load(tgt_path)             # (11160, 2) physical
             targets_anom = targets_raw - clim_mean        # anomaly relative to 1979-2000
             targets_norm = np.stack([
@@ -291,22 +314,42 @@ class ReconDataset:
                 targets_anom[:, 1] / self.precip_std,
             ], axis=1).astype(np.float32)
 
-            # Replace ice core proxy obs with ERA5 values at obs grid nodes.
-            # This trains the GNN as a pure spatial interpolator: given the
-            # true ERA5 values at 135 locations, reconstruct the full field.
-            # At reconstruction time, ice core proxy values are substituted.
-            obs_feats = obs['features'].copy()
-            grid_indices = obs['grid_indices']
-            for k, g in enumerate(grid_indices):
-                # iso channel (col 0): ERA5 T anomaly normalised by temp_std
-                if obs_feats[k, 1] > 0:  # iso available at this node
-                    obs_feats[k, 0] = targets_anom[g, 0] / self.temp_std
-                # accum channel (col 2): ERA5 P anomaly normalised by precip_std
-                if obs_feats[k, 3] > 0:  # accum available at this node
-                    obs_feats[k, 2] = targets_anom[g, 1] / self.precip_std
-            obs = dict(obs)
-            obs['features'] = obs_feats
+            # Build obs features from ERA5 values at obs grid nodes.
+            # Use the static grid map (all iso+accum nodes) regardless of
+            # whether ice core data exists for this year -- we only need
+            # the grid topology and ERA5 values for training.
+            iso_grid   = sorted(loader.iso_grid_map.keys())
+            accum_grid = sorted(loader.accum_grid_map.keys())
+            all_grid   = iso_grid + accum_grid
+            from ice_core_loader import grid_index_to_latlon
+            obs_lats = np.array([grid_index_to_latlon(g)[0] for g in all_grid],
+                                 dtype=np.float32)
+            obs_lons = np.array([grid_index_to_latlon(g)[1] for g in all_grid],
+                                 dtype=np.float32)
+            n_iso   = len(iso_grid)
+            n_obs   = len(all_grid)
 
+            obs_feats = np.zeros((n_obs, 518), dtype=np.float32)
+            for k, g in enumerate(all_grid):
+                is_iso   = k < n_iso
+                iso_val  = targets_anom[g, 0] / self.temp_std   if is_iso  else 0.0
+                accum_val= targets_anom[g, 1] / self.precip_std if not is_iso else 0.0
+                obs_feats[k, 0] = iso_val
+                obs_feats[k, 1] = 1.0 if is_iso else 0.0
+                obs_feats[k, 2] = accum_val
+                obs_feats[k, 3] = 0.0 if is_iso else 1.0
+                obs_feats[k, 4] = obs_lats[k]
+                obs_feats[k, 5] = obs_lons[k]
+                obs_feats[k, 6:] = loader.clim_embedding[g]
+
+            obs = {
+                'features':     obs_feats,
+                'grid_indices': np.array(all_grid, dtype=np.int32),
+                'lats':         obs_lats,
+                'lons':         obs_lons,
+                'n_obs':        n_obs,
+                'year':         yr,
+            }
             self.samples.append((obs, targets_norm))
 
         logger.info(f"  Dataset: {len(self.samples)} samples loaded, {skipped} skipped")
@@ -363,8 +406,8 @@ def spatial_variance_penalty(predictions: jnp.ndarray,
 
 
 def make_forward_fn(hidden_size: int, n_t2t_rounds: int):
-    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, t2t_s, t2t_r):
-        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r,
+    def _forward(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r):
+        return reconstruction_gnn(obs_feats, tgt_feats, o2t_s, o2t_r, o2t_sim,
                                    t2t_s, t2t_r, hidden_size, n_t2t_rounds)
     return hk.transform(_forward)
 
@@ -429,9 +472,12 @@ def train(args, logger: logging.Logger):
     o2t_s0 = jnp.array(o2t_s0_np)
     o2t_r0 = jnp.array(o2t_r0_np)
 
+    o2t_sim0 = jnp.array(compute_o2t_edge_sim(
+        obs0['grid_indices'], o2t_s0_np, o2t_r0_np, loader.clim_embedding
+    ))
     rng, init_rng = jax.random.split(rng)
     params = forward.init(init_rng, obs_feats0, tgt_feats,
-                          o2t_s0, o2t_r0, t2t_s, t2t_r)
+                          o2t_s0, o2t_r0, o2t_sim0, t2t_s, t2t_r)
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(params))
     logger.info(f"  Model parameters: {n_params:,}")
 
@@ -450,10 +496,11 @@ def train(args, logger: logging.Logger):
     opt_state = optimiser.init(params)
 
     @jax.jit
-    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r):
+    def train_step(params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r,
+                   o2t_sim):
         def loss_fn(p):
             preds = forward.apply(p, None, obs_feats, tgt_feats,
-                                  o2t_s, o2t_r, t2t_s, t2t_r)
+                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
             return mse_loss(preds, tgt_targets)
         loss, grads = jax.value_and_grad(loss_fn)(params)
         updates, new_opt_state = optimiser.update(grads, opt_state, params)
@@ -491,13 +538,17 @@ def train(args, logger: logging.Logger):
                 TARGET_LATS, TARGET_LONS, OBS_TO_TGT_RADIUS_DEG,
             )
 
+            o2t_sim_np  = compute_o2t_edge_sim(
+                obs['grid_indices'], o2t_s_np, o2t_r_np, loader.clim_embedding
+            )
             obs_feats   = jnp.array(obs_feats_np)
             tgt_targets = jnp.array(targets_norm)
             o2t_s       = jnp.array(o2t_s_np)
             o2t_r       = jnp.array(o2t_r_np)
+            o2t_sim     = jnp.array(o2t_sim_np)
 
             params, opt_state, loss = train_step(
-                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r
+                params, opt_state, obs_feats, tgt_targets, o2t_s, o2t_r, o2t_sim
             )
             epoch_loss += float(loss)
 

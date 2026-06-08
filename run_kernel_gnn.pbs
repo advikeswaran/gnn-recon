@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N kernel_gnn
+#PBS -q main
+#PBS -l select=1:ncpus=4:ngpus=1:mem=32GB
+#PBS -l walltime=02:00:00
+#PBS -A P93300301
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/kernel_gnn.out
+#PBS -e /glade/derecho/scratch/advike/graphcast_recon/logs/kernel_gnn.err
+
+module load cuda/12.9.0
+module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+cd /glade/derecho/scratch/advike/graphcast_recon
+python3 recon_gnn_kernel.py --epochs 300 --lr 1e-3 --hidden 32 --kernel-dim 32 --mesh-rounds 4 

@@ -32,7 +32,7 @@ EMB_YEARS      = set(range(1979, 2018))    # years with window embeddings
 N_ENSEMBLE     = 50
 HIDDEN         = 128
 T2T_ROUNDS     = 6
-OBS_TO_TGT_DEG = 9.0
+OBS_TO_TGT_DEG = 45.0
 TGT_TO_TGT_DEG = 2.0
 
 
@@ -63,8 +63,13 @@ def compute_residual_stds():
     iso_r2   = np.clip(iso_r2,   0.0, 1.0)
     accum_r2 = np.clip(accum_r2, 0.0, 1.0)
 
-    iso_resid_std   = temp_std * np.sqrt(1.0 - iso_r2)    # (n_iso,)  K
-    accum_resid_std = prec_std * np.sqrt(1.0 - accum_r2)  # (n_accum,) m/yr
+    # use ERA5 anomaly std (not full field std) to match training normalisation
+    era5_anom = np.load(os.path.join(CACHE_DIR, "era5_targets",
+                                     "anom_std_1979_2000.npz"))
+    era5_t_std = float(era5_anom["temp_anom_std"])
+    era5_p_std = float(era5_anom["prec_anom_std"])
+    iso_resid_std   = era5_t_std * np.sqrt(1.0 - iso_r2)    # (n_iso,)  K
+    accum_resid_std = era5_p_std * np.sqrt(1.0 - accum_r2)  # (n_accum,) m/yr
 
     return iso_resid_std, accum_resid_std
 
@@ -102,6 +107,11 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
     )
     o2t_s = jnp.array(o2t_s_np)
     o2t_r = jnp.array(o2t_r_np)
+
+    from train_head import compute_o2t_edge_sim
+    o2t_sim = jnp.array(compute_o2t_edge_sim(
+        obs_grid_indices, o2t_s_np, o2t_r_np, loader.clim_embedding
+    ))
 
     # -- identify which obs nodes are iso vs accum ----------------------------
     # features layout: [iso_val, iso_avail, accum_val, accum_avail, lat, lon, emb]
@@ -167,7 +177,7 @@ def run_year(yr, forward, params, loader, tgt_feats, clim_emb,
         pred_norm = forward.apply(
             params, None,
             jnp.array(obs_feats_perturbed), tgt_feats,
-            o2t_s, o2t_r, t2t_s, t2t_r,
+            o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r,
         )
         ensemble_preds[e] = np.array(pred_norm)
 
@@ -279,10 +289,11 @@ def main():
 
     # init with dummy inputs to get pytree structure
     dummy_obs = jnp.zeros((135, 518), dtype=jnp.float32)   # 135 = typical n_obs
-    dummy_o2t_s = jnp.zeros(1, dtype=jnp.int32)
-    dummy_o2t_r = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_s   = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_r   = jnp.zeros(1, dtype=jnp.int32)
+    dummy_o2t_sim = jnp.zeros((1, 1), dtype=jnp.float32)
     params = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
-                          dummy_o2t_s, dummy_o2t_r, t2t_s, t2t_r)
+                          dummy_o2t_s, dummy_o2t_r, dummy_o2t_sim, t2t_s, t2t_r)
 
     weights_path = os.path.join(RECON_DIR, "weights", "weights_final.npz")
     raw    = np.load(weights_path)

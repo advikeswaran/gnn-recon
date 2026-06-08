@@ -21,7 +21,7 @@ CACHE_DIR  = os.path.join(RECON_DIR, "cache")
 VAL_YEARS  = list(range(2001, 2006))
 HIDDEN         = 128
 T2T_ROUNDS     = 6
-OBS_TO_TGT_DEG = 9.0
+OBS_TO_TGT_DEG = 45.0
 TGT_TO_TGT_DEG = 2.0
 N_OUTPUT       = 2
 
@@ -59,6 +59,11 @@ def run_infer():
     )  # (11160, 2)  col0=T(K) col1=P(m/yr)
     print(f"[infer] clim mean: T={clim_mean[:,0].mean():.2f}K  "
           f"P={clim_mean[:,1].mean():.4f}m/yr")
+
+    # ── ERA5 anomaly stds for obs normalisation (must match training)
+    _era5_anom = np.load(os.path.join(CACHE_DIR, "era5_targets", "anom_std_1979_2000.npz"))
+    era5_temp_anom_std = float(_era5_anom["temp_anom_std"])
+    era5_prec_anom_std = float(_era5_anom["prec_anom_std"])
 
     # ── loader ────────────────────────────────────────────────────────────────
     loader = IceCoreLoader(
@@ -103,11 +108,18 @@ def run_infer():
     o2t_r = jnp.array(o2t_r_np)
     print(f"[infer] o2t edges: {o2t_s.shape[0]:,}")
 
+    # ── embedding similarity edge features ───────────────────────────────────
+    from train_head import compute_o2t_edge_sim
+    o2t_sim = jnp.array(compute_o2t_edge_sim(
+        np.array(obs_grid_indices), o2t_s_np, o2t_r_np, loader.clim_embedding
+    ))
+
     # ── model + weights ───────────────────────────────────────────────────────
     forward = make_forward_fn(HIDDEN, T2T_ROUNDS)
     dummy_obs = jnp.zeros((n_obs, 518), dtype=jnp.float32)
+    dummy_sim = jnp.zeros((o2t_s.shape[0], 1), dtype=jnp.float32)
     params    = forward.init(jax.random.PRNGKey(0), dummy_obs, tgt_feats,
-                             o2t_s, o2t_r, t2t_s, t2t_r)
+                             o2t_s, o2t_r, dummy_sim, t2t_s, t2t_r)
     raw    = np.load(os.path.join(RECON_DIR, "weights", "weights_final.npz"))
     leaves = [raw[str(i)] for i in range(len(raw.files))]
     params = jax.tree_util.tree_unflatten(
@@ -172,7 +184,7 @@ def run_infer():
 
         print(f"[infer] {yr}: running forward pass ...")
         pred_norm = forward.apply(params, None, obs_feats_jnp, tgt_feats,
-                                  o2t_s, o2t_r, t2t_s, t2t_r)
+                                  o2t_s, o2t_r, o2t_sim, t2t_s, t2t_r)
         pred_norm = np.array(pred_norm)  # (11160, 2) normalised anomalies
 
         tmp = out_path.replace(".npy", ".tmp.npy")
