@@ -13,4 +13,4 @@ module load conda/latest
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate graphcast
 cd /glade/derecho/scratch/advike/graphcast_recon
-python3 recon_gnn_kernel.py --epochs 300 --lr 1e-3 --hidden 32 --kernel-dim 32 --mesh-rounds 4 
+python3 recon_gnn_kernel.py --epochs 200 --lr 1e-3 --hidden 32 --kernel-dim 32 --mesh-rounds 4 
