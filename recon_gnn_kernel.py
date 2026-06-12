@@ -197,15 +197,20 @@ def kernel_gnn(
 
 def make_forward(hidden, n_rounds, kernel_dim, noise_var,
                  mesh_pos_np, mesh_lats, mesh_lons,
-                 obs_mesh_nn_np, grid_mesh_nn_np):
-    """Create forward function for T or P separately."""
-    mesh_lats_j = jnp.array(mesh_lats)
-    mesh_lons_j = jnp.array(mesh_lons)
+                 obs_mesh_nn_np, grid_mesh_nn_np,
+                 obs_node_noise_np=None):
+    """Create forward function for T or P separately.
+    obs_node_noise_np: (n_obs,) per-node noise from calibration R2.
+                       If None, uses learned scalar noise (homoscedastic).
+    """
     mesh_pos_j  = jnp.array(mesh_pos_np)
     obs_nn_j    = jnp.array(obs_mesh_nn_np)
     grid_nn_j   = jnp.array(grid_mesh_nn_np)
     n_mesh = len(mesh_lats)
-    ms_j = None; mr_j = None  # set externally
+    # heteroscedastic: fixed per-node noise scaled by learned global factor
+    use_hetero = obs_node_noise_np is not None
+    if use_hetero:
+        obs_noise_j = jnp.array(obs_node_noise_np.astype(np.float32))
 
     def fwd(obs_vals, ms, mr):
         # compute phi for all mesh nodes via message passing
@@ -218,7 +223,6 @@ def make_forward(hidden, n_rounds, kernel_dim, noise_var,
             upd    = hk.Linear(kernel_dim, name=f"m2m_{i}")(
                 jnp.concatenate([mesh_h, msg / jnp.maximum(cnt[:,None], 1.)], axis=-1))
             mesh_h = mesh_h + jax.nn.relu(upd)
-            # normalize to keep kernel values bounded
             mesh_h = mesh_h / (jnp.linalg.norm(mesh_h, axis=-1, keepdims=True) + 1e-8)
 
         phi_obs  = mesh_h[obs_nn_j]   # (n_obs, kernel_dim)
@@ -229,8 +233,16 @@ def make_forward(hidden, n_rounds, kernel_dim, noise_var,
 
         log_noise = hk.get_parameter("log_noise", [],
                         init=lambda *_: jnp.log(jnp.array(noise_var)))
-        noise = jnp.exp(log_noise)
-        K_oo_reg = K_oo + noise * jnp.eye(obs_vals.shape[0])
+        noise_scale = jnp.exp(log_noise)
+
+        if use_hetero:
+            # heteroscedastic: diagonal noise proportional to (1-R2)/R2
+            # noise_scale is a global multiplier, obs_noise_j is per-node shape
+            noise_diag = noise_scale * obs_noise_j
+            K_oo_reg = K_oo + jnp.diag(noise_diag)
+        else:
+            K_oo_reg = K_oo + noise_scale * jnp.eye(obs_vals.shape[0])
+
         alpha = jnp.linalg.solve(K_oo_reg, obs_vals)
         return K_go @ alpha
 
@@ -289,29 +301,32 @@ def train(args, logger):
         if not p.exists(): continue
         era5 = np.load(p)
         anom = era5 - clim_mean
-        # obs values
         t_obs = (anom[obs_grid,0]/t_std).astype(np.float32)
         p_obs = (anom[obs_grid,1]/p_std).astype(np.float32)
-        # targets at all grid nodes
         t_tgt = (anom[:,0]/t_std).astype(np.float32)
         p_tgt = (anom[:,1]/p_std).astype(np.float32)
-        # iso nodes predict T, accum nodes predict P
-        t_obs_iso   = t_obs[:n_iso]    # only iso nodes for T
-        p_obs_accum = p_obs[n_iso:]    # only accum nodes for P
+        t_obs_iso   = t_obs[:n_iso]
+        p_obs_accum = p_obs[n_iso:]
         samples.append((t_obs_iso, p_obs_accum, t_tgt, p_tgt))
     logger.info(f"  {len(samples)} samples")
 
-    # separate obs mesh nn for iso and accum
     obs_mesh_nn_iso   = obs_mesh_nn[:n_iso]
     obs_mesh_nn_accum = obs_mesh_nn[n_iso:]
 
-    # build two forward functions (T and P separately)
+    # load per-node R2 noise
+    iso_node_noise   = np.load(str(CACHE_DIR/'iso_node_noise.npy'))
+    accum_node_noise = np.load(str(CACHE_DIR/'accum_node_noise.npy'))
+    logger.info(f"  iso noise: mean={iso_node_noise.mean():.1f} max={iso_node_noise.max():.1f}")
+    logger.info(f"  accum noise: mean={accum_node_noise.mean():.1f} max={accum_node_noise.max():.1f}")
+
     fwd_T = make_forward(args.hidden, args.mesh_rounds, args.kernel_dim,
                          args.noise_var, mesh_pos_np, mesh_lats, mesh_lons,
-                         obs_mesh_nn_iso, grid_mesh_nn)
+                         obs_mesh_nn_iso, grid_mesh_nn,
+                         obs_node_noise_np=iso_node_noise)
     fwd_P = make_forward(args.hidden, args.mesh_rounds, args.kernel_dim,
                          args.noise_var, mesh_pos_np, mesh_lats, mesh_lons,
-                         obs_mesh_nn_accum, grid_mesh_nn)
+                         obs_mesh_nn_accum, grid_mesh_nn,
+                         obs_node_noise_np=accum_node_noise)
 
     # init
     rng = jax.random.PRNGKey(42)

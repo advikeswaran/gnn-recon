@@ -1,0 +1,18 @@
+#!/bin/bash
+#PBS -N era5_targets_4
+#PBS -A P93300301
+#PBS -q main
+#PBS -l select=1:ncpus=4:ngpus=0:mem=32GB
+#PBS -l walltime=12:00:00
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/targets_2009_2017.log
+#PBS -j oe
+
+module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+
+cd /glade/derecho/scratch/advike/graphcast_recon
+for year in $(seq 2009 2017); do
+    python3 era5_targets.py --year $year
+done
