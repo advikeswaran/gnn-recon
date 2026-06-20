@@ -1,0 +1,16 @@
+#!/bin/bash
+#PBS -N plot_hetero
+#PBS -q main
+#PBS -l select=1:ncpus=4:ngpus=0:mem=32GB
+#PBS -l walltime=01:00:00
+#PBS -A P93300301
+#PBS -l job_priority=premium
+#PBS -o /glade/derecho/scratch/advike/graphcast_recon/logs/plot_hetero.out
+#PBS -e /glade/derecho/scratch/advike/graphcast_recon/logs/plot_hetero.err
+
+module load conda/latest
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate graphcast
+cd /glade/derecho/scratch/advike/graphcast_recon
+python3 plot_summary_hetero.py
+python3 plot_spatial_trends_hetero.py
