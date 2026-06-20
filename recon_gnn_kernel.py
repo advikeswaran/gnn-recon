@@ -105,6 +105,50 @@ def norm_pos(lats, lons):
         np.cos(np.radians(lons)),
     ], axis=1).astype(np.float32)
 
+def mesh_knn(node_lats, node_lons, mesh_lats, mesh_lons, k):
+    """For each node, the k nearest mesh nodes and inverse-distance weights
+    (normalized to sum 1). Used to smoothly interpolate mesh features onto
+    obs/grid nodes instead of snapping to the single nearest (which produces
+    blocky Voronoi-patch fields). Returns (idx (n,k) int32, w (n,k) float32)."""
+    n = len(node_lats)
+    idx = np.zeros((n, k), dtype=np.int32)
+    w   = np.zeros((n, k), dtype=np.float32)
+    for i, (la, lo) in enumerate(zip(node_lats, node_lons)):
+        d  = haversine_deg(la, lo, mesh_lats, mesh_lons)
+        nn = np.argsort(d)[:k]
+        ww = 1.0 / (d[nn] + 1e-6)
+        idx[i] = nn
+        w[i]   = ww / ww.sum()
+    return idx, w
+
+def mesh_embeddings(mesh_lats, mesh_lons, n_pca, cache_path=None):
+    """Aggregate climatological GraphCast embeddings (N_GRID, 512) onto the
+    icosahedral mesh nodes via nearest ERA5 grid node, standardize per-dim,
+    and PCA-reduce to n_pca components.
+
+    The result is deterministic and cached so that train and apply use bit-
+    identical mesh features. Returns (n_mesh, n_pca) float32.
+    """
+    if cache_path is not None and Path(cache_path).exists():
+        return np.load(cache_path).astype(np.float32)
+    emb = np.load(EMB_DIR / 'embedding_clim.npy').astype(np.float64)  # (N_GRID, 512)
+    # nearest ERA5 grid node for each mesh node
+    nn = np.array([
+        np.argmin(haversine_deg(la, lo, TARGET_LATS, TARGET_LONS))
+        for la, lo in zip(mesh_lats, mesh_lons)
+    ], dtype=np.int32)
+    me = emb[nn]                                   # (n_mesh, 512)
+    me = (me - me.mean(0)) / (me.std(0) + 1e-8)    # per-dim z-score (centers it)
+    if 0 < n_pca < me.shape[1]:
+        # PCA on the centered matrix via SVD; take top-n_pca component scores
+        U, S, _ = np.linalg.svd(me, full_matrices=False)
+        me = U[:, :n_pca] * S[:n_pca]
+        me = (me - me.mean(0)) / (me.std(0) + 1e-8)  # unit-variance components
+    me = me.astype(np.float32)
+    if cache_path is not None:
+        np.save(cache_path, me)
+    return me
+
 def kernel_gnn(
     all_pos,      # (n_all, 3) positional features for ALL nodes (obs + grid)
     mesh_pos,     # (n_mesh, 3) mesh node positions
@@ -198,15 +242,34 @@ def kernel_gnn(
 def make_forward(hidden, n_rounds, kernel_dim, noise_var,
                  mesh_pos_np, mesh_lats, mesh_lons,
                  obs_mesh_nn_np, grid_mesh_nn_np,
-                 obs_node_noise_np=None):
+                 obs_node_noise_np=None, mesh_emb_np=None,
+                 obs_knn_np=None, grid_knn_np=None):
     """Create forward function for T or P separately.
     obs_node_noise_np: (n_obs,) per-node noise from calibration R2.
                        If None, uses learned scalar noise (homoscedastic).
+    mesh_emb_np: (n_mesh, n_emb) GraphCast embedding features per mesh node.
+                 If provided, concatenated with positional features as the
+                 initial mesh representation fed to phi_enc.
+    obs_knn_np, grid_knn_np: (idx (n,k), w (n,k)) from mesh_knn(). If provided,
+                 phi for obs/grid nodes is inverse-distance interpolated over the
+                 k nearest mesh nodes (then renormalized) instead of snapped to
+                 the single nearest. Smooths out blocky Voronoi-patch output.
     """
     mesh_pos_j  = jnp.array(mesh_pos_np)
     obs_nn_j    = jnp.array(obs_mesh_nn_np)
     grid_nn_j   = jnp.array(grid_mesh_nn_np)
     n_mesh = len(mesh_lats)
+    # optional k-NN interpolation of mesh features onto obs/grid nodes
+    obs_knn_idx_j  = jnp.array(obs_knn_np[0])  if obs_knn_np  is not None else None
+    obs_knn_w_j    = jnp.array(obs_knn_np[1])  if obs_knn_np  is not None else None
+    grid_knn_idx_j = jnp.array(grid_knn_np[0]) if grid_knn_np is not None else None
+    grid_knn_w_j   = jnp.array(grid_knn_np[1]) if grid_knn_np is not None else None
+    # initial mesh features: position, optionally augmented with embeddings
+    if mesh_emb_np is not None:
+        mesh_feat_j = jnp.concatenate(
+            [mesh_pos_j, jnp.array(mesh_emb_np.astype(np.float32))], axis=-1)
+    else:
+        mesh_feat_j = mesh_pos_j
     # heteroscedastic: fixed per-node noise scaled by learned global factor
     use_hetero = obs_node_noise_np is not None
     if use_hetero:
@@ -214,7 +277,7 @@ def make_forward(hidden, n_rounds, kernel_dim, noise_var,
 
     def fwd(obs_vals, ms, mr):
         # compute phi for all mesh nodes via message passing
-        mesh_h = hk.Linear(kernel_dim, name="phi_enc")(mesh_pos_j)
+        mesh_h = hk.Linear(kernel_dim, name="phi_enc")(mesh_feat_j)
         mesh_h = jax.nn.relu(mesh_h)
 
         for i in range(n_rounds):
@@ -225,8 +288,16 @@ def make_forward(hidden, n_rounds, kernel_dim, noise_var,
             mesh_h = mesh_h + jax.nn.relu(upd)
             mesh_h = mesh_h / (jnp.linalg.norm(mesh_h, axis=-1, keepdims=True) + 1e-8)
 
-        phi_obs  = mesh_h[obs_nn_j]   # (n_obs, kernel_dim)
-        phi_grid = mesh_h[grid_nn_j]  # (n_grid, kernel_dim)
+        def gather_phi(nn_j, knn_idx_j, knn_w_j):
+            # interpolate (IDW over k nearest mesh nodes) if knn provided,
+            # else snap to single nearest mesh node
+            if knn_idx_j is None:
+                return mesh_h[nn_j]
+            ph = (mesh_h[knn_idx_j] * knn_w_j[..., None]).sum(axis=1)
+            return ph / (jnp.linalg.norm(ph, axis=-1, keepdims=True) + 1e-8)
+
+        phi_obs  = gather_phi(obs_nn_j,  obs_knn_idx_j,  obs_knn_w_j)   # (n_obs, kernel_dim)
+        phi_grid = gather_phi(grid_nn_j, grid_knn_idx_j, grid_knn_w_j)  # (n_grid, kernel_dim)
 
         K_oo = phi_obs  @ phi_obs.T
         K_go = phi_grid @ phi_obs.T
@@ -292,6 +363,14 @@ def train(args, logger):
 
     ms = jnp.array(ms_np); mr = jnp.array(mr_np)
 
+    # optionally aggregate GraphCast embeddings onto mesh nodes
+    mesh_emb_np = None
+    if args.emb_pca > 0:
+        mesh_emb_np = mesh_embeddings(
+            mesh_lats, mesh_lons, args.emb_pca,
+            cache_path=str(CACHE_DIR/f'mesh_emb_pca{args.emb_pca}.npy'))
+        logger.info(f"  mesh embeddings: {mesh_emb_np.shape} (PCA={args.emb_pca})")
+
     # build dataset
     logger.info("Building dataset...")
     samples = []
@@ -313,20 +392,37 @@ def train(args, logger):
     obs_mesh_nn_iso   = obs_mesh_nn[:n_iso]
     obs_mesh_nn_accum = obs_mesh_nn[n_iso:]
 
-    # load per-node R2 noise
-    iso_node_noise   = np.load(str(CACHE_DIR/'iso_node_noise.npy'))
-    accum_node_noise = np.load(str(CACHE_DIR/'accum_node_noise.npy'))
-    logger.info(f"  iso noise: mean={iso_node_noise.mean():.1f} max={iso_node_noise.max():.1f}")
-    logger.info(f"  accum noise: mean={accum_node_noise.mean():.1f} max={accum_node_noise.max():.1f}")
+    # optional smooth mesh->node interpolation (replaces nearest-node snap)
+    obs_knn_iso = obs_knn_accum = grid_knn = None
+    if args.interp_k > 1:
+        obs_lats_iso,   obs_lons_iso   = obs_lats[:n_iso],  obs_lons[:n_iso]
+        obs_lats_accum, obs_lons_accum = obs_lats[n_iso:],  obs_lons[n_iso:]
+        obs_knn_iso   = mesh_knn(obs_lats_iso,   obs_lons_iso,   mesh_lats, mesh_lons, args.interp_k)
+        obs_knn_accum = mesh_knn(obs_lats_accum, obs_lons_accum, mesh_lats, mesh_lons, args.interp_k)
+        grid_knn      = mesh_knn(TARGET_LATS,    TARGET_LONS,    mesh_lats, mesh_lons, args.interp_k)
+        logger.info(f"  mesh->node interpolation: k={args.interp_k} (IDW)")
+
+    # per-node R2 noise: used only for the heteroscedastic variant.
+    # Default (homoscedastic) matches the preferred baseline model.
+    iso_node_noise = accum_node_noise = None
+    if args.hetero:
+        iso_node_noise   = np.load(str(CACHE_DIR/'iso_node_noise.npy'))
+        accum_node_noise = np.load(str(CACHE_DIR/'accum_node_noise.npy'))
+        logger.info(f"  iso noise: mean={iso_node_noise.mean():.1f} max={iso_node_noise.max():.1f}")
+        logger.info(f"  accum noise: mean={accum_node_noise.mean():.1f} max={accum_node_noise.max():.1f}")
+    else:
+        logger.info("  homoscedastic noise (scalar learned noise_scale)")
 
     fwd_T = make_forward(args.hidden, args.mesh_rounds, args.kernel_dim,
                          args.noise_var, mesh_pos_np, mesh_lats, mesh_lons,
                          obs_mesh_nn_iso, grid_mesh_nn,
-                         obs_node_noise_np=iso_node_noise)
+                         obs_node_noise_np=iso_node_noise, mesh_emb_np=mesh_emb_np,
+                         obs_knn_np=obs_knn_iso, grid_knn_np=grid_knn)
     fwd_P = make_forward(args.hidden, args.mesh_rounds, args.kernel_dim,
                          args.noise_var, mesh_pos_np, mesh_lats, mesh_lons,
                          obs_mesh_nn_accum, grid_mesh_nn,
-                         obs_node_noise_np=accum_node_noise)
+                         obs_node_noise_np=accum_node_noise, mesh_emb_np=mesh_emb_np,
+                         obs_knn_np=obs_knn_accum, grid_knn_np=grid_knn)
 
     # init
     rng = jax.random.PRNGKey(42)
@@ -375,6 +471,10 @@ def train(args, logger):
     logger.info(f"  {len(val_samples)} validation years: 2001-2005")
 
     best_val = float('inf')
+    # tag weights by config so runs don't clobber each other / the baseline
+    tag = "_emb" if args.emb_pca > 0 else ""
+    tag += "_hetero" if args.hetero else "_homo"
+    tag += f"_interp{args.interp_k}" if args.interp_k > 1 else ""
 
     for epoch in range(1, args.epochs+1):
         t0 = time.time()
@@ -413,11 +513,11 @@ def train(args, logger):
             best_val = vl
             flat_T = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_T)))}
             flat_P = {str(i):v for i,v in enumerate(jax.tree_util.tree_leaves(jax.device_get(params_P)))}
-            np.savez_compressed(str(WEIGHTS_DIR/"best_T.npz"), **flat_T)
-            np.savez_compressed(str(WEIGHTS_DIR/"best_P.npz"), **flat_P)
+            np.savez_compressed(str(WEIGHTS_DIR/f"best_T{tag}.npz"), **flat_T)
+            np.savez_compressed(str(WEIGHTS_DIR/f"best_P{tag}.npz"), **flat_P)
             logger.info(f"  Best val: {best_val:.4f} (epoch {epoch})")
 
-    logger.info(f"Done. Best val: {best_val:.4f}")
+    logger.info(f"Done. Best val: {best_val:.4f}  weights: best_[TP]{tag}.npz")
 
 
 def main():
@@ -429,6 +529,15 @@ def main():
     p.add_argument("--mesh-rounds", type=int,   default=3)
     p.add_argument("--noise-var",   type=float, default=0.1)
     p.add_argument("--refinements", type=int,   default=4)
+    p.add_argument("--emb-pca",     type=int,   default=0,
+                   help="PCA components of GraphCast embeddings added to mesh "
+                        "features; 0 disables (position-only baseline)")
+    p.add_argument("--hetero",      action="store_true",
+                   help="use heteroscedastic per-node R2 noise; default is "
+                        "homoscedastic (the preferred baseline)")
+    p.add_argument("--interp-k",    type=int,   default=1,
+                   help="k nearest mesh nodes for IDW interpolation of mesh "
+                        "features onto obs/grid; 1 = nearest-node snap (baseline)")
     p.add_argument("--dry-run",     action="store_true")
     args = p.parse_args()
 
